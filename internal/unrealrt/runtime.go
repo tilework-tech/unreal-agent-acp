@@ -1,6 +1,6 @@
 // VENDORED from github.com/unreallabsai/unreal-agent@1b9f778
-//   cmd/internal/agentrunner/run.go (Run, openSession, resolveSessionDirectory,
-//   resolveMaxAttempts, selectProvider, reasoningEffort, defaultSystemPrompt)
+//   cmd/internal/agentrunner/run.go (Run, resolveSessionDirectory,
+//   resolveMaxAttempts, selectProvider, defaultSystemPrompt)
 // Modified: the one-shot Run is split into a long-lived Runtime and per-session
 // Session with Prompt/Cancel/Replay/Close. Request parsing, flags, JSONL output,
 // log files and loadDotEnv are dropped. One store observer per Runtime instead
@@ -67,6 +67,7 @@ var (
 	ErrSessionNotFound  = errors.New("unrealrt: session not found")
 	ErrPromptInProgress = errors.New("unrealrt: a prompt is already running for this session")
 	ErrClosed           = errors.New("unrealrt: closed")
+	ErrInvalidCwd       = errors.New("unrealrt: invalid cwd")
 )
 
 type Config struct {
@@ -742,15 +743,15 @@ func submitControl(ctx context.Context, inputs *inbox.Inbox, message inbox.Contr
 
 func validateCwd(cwd string) (string, error) {
 	if !filepath.IsAbs(cwd) {
-		return "", fmt.Errorf("cwd %q must be an absolute path", cwd)
+		return "", fmt.Errorf("%w: %q must be an absolute path", ErrInvalidCwd, cwd)
 	}
 	cwd = filepath.Clean(cwd)
 	info, err := os.Stat(cwd)
 	if err != nil {
-		return "", fmt.Errorf("inspect cwd: %w", err)
+		return "", fmt.Errorf("%w: %w", ErrInvalidCwd, err)
 	}
 	if !info.IsDir() {
-		return "", fmt.Errorf("cwd %q is not a directory", cwd)
+		return "", fmt.Errorf("%w: %q is not a directory", ErrInvalidCwd, cwd)
 	}
 	return cwd, nil
 }

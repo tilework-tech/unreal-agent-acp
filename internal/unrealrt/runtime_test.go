@@ -596,8 +596,8 @@ func TestModelAndReasoningEffortApplyToNextPrompt(t *testing.T) {
 func TestNewSessionRequiresAbsoluteExistingCwd(t *testing.T) {
 	f := newFixture(t, fakemodel.Sequence())
 	for _, cwd := range []string{"relative/path", filepath.Join(t.TempDir(), "missing")} {
-		if _, err := f.runtime.NewSession(t.Context(), unrealrt.Options{Cwd: cwd}); err == nil {
-			t.Errorf("NewSession accepted cwd %q", cwd)
+		if _, err := f.runtime.NewSession(t.Context(), unrealrt.Options{Cwd: cwd}); !errors.Is(err, unrealrt.ErrInvalidCwd) {
+			t.Errorf("NewSession(cwd %q) err = %v, want ErrInvalidCwd", cwd, err)
 		}
 	}
 }
