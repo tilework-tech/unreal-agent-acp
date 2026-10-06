@@ -1,0 +1,14 @@
+unreal-agent-acp
+
+This repository contains code derived from the following projects. Their
+license texts are kept under third_party/.
+
+- unreal-agent (MIT, Copyright (c) 2026 Unreal Labs)
+  https://github.com/unreallabsai/unreal-agent
+  Files under internal/unrealrt/ marked "VENDORED" are modified copies of
+  cmd/internal/agentrunner. See VENDORED.md and third_party/unreal-agent/LICENSE.
+
+- acp-go-sdk schema generator (Apache-2.0, Copyright Coder Technologies Inc.)
+  https://github.com/coder/acp-go-sdk
+  tools/acpgen/ is a modified fork of cmd/generate. See
+  third_party/acp-go-sdk/LICENSE.
