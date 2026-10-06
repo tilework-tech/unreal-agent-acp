@@ -11,8 +11,8 @@ commit.
 
 | Our file | Upstream file @ pinned commit | What changed | Why |
 |---|---|---|---|
-| `internal/unrealrt/runtime.go` | `cmd/internal/agentrunner/run.go` (`Run`, `openSession`, `resolveSessionDirectory`, `reasoningEffort`, provider/key resolution) | One-shot `Run` split into `Runtime` + `Session` (`NewSession`, `ResumeSession`, `Prompt`, `Cancel`, `Replay`, `Close`). Request parsing, flags, JSONL output and `loadDotEnv` dropped. One store observer per runtime instead of one per run. | ACP needs many prompts per session and many sessions per process; `loadDotEnv` mutates process-wide env. |
-| `internal/unrealrt/providers.go` | `cmd/internal/agentrunner/providers.go`, `config.go` (`Provider`, `Client`) | Copied verbatim except package name. | `DefaultProviders` is internal upstream. |
+| `internal/unrealrt/runtime.go` | `cmd/internal/agentrunner/run.go` (`Run`, `resolveSessionDirectory`, `resolveMaxAttempts`, `selectProvider`, `defaultSystemPrompt`, provider/key resolution) | One-shot `Run` split into `Runtime` + `Session` (`NewSession`, `ResumeSession`, `Prompt`, `Cancel`, `Replay`, `Close`). Request parsing, flags, JSONL output and `loadDotEnv` dropped. One store observer per runtime instead of one per run. | ACP needs many prompts per session and many sessions per process; `loadDotEnv` mutates process-wide env. |
+| `internal/unrealrt/providers.go` | `cmd/internal/agentrunner/providers.go`, `run.go` (`Provider`, `Client`) | Copied verbatim except package name. | `DefaultProviders` is internal upstream. |
 
 Pristine copies of every upstream file listed above live under
 `third_party/unreal-agent/` at the pinned commit.
@@ -34,7 +34,7 @@ These need upstream changes; they are not worked around here.
   deltas, so ACP clients receive one `agent_message_chunk` per completed
   model message.
 - **Session metadata.** The session store has no title or cwd. We keep a
-  sidecar `<id>.acp.json` next to each session file.
+  sidecar `<id>.acp.json` next to each session file (`internal/unrealrt/metadata.go`, ours, not vendored).
 - **Long-lived coordinator.** `coordinator.Run` is single-use, so each prompt
   rebuilds the coordinator from the session file.
 - **Per-session environment.** `operation.ShellInput` has no environment, so
