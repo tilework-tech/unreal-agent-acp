@@ -329,6 +329,8 @@ func (runtime *Runtime) ResumeSession(ctx context.Context, id session.ID, option
 	if err != nil {
 		return nil, fmt.Errorf("open session %q: %w", id, err)
 	}
+	// Two coordinators must never append to the same session file.
+	runtime.closeTracked(id)
 	meta, err := runtime.loadMetadata(id)
 	if errors.Is(err, fs.ErrNotExist) {
 		meta = metadata{CreatedAt: snapshot.Session.CreatedAt}
@@ -380,18 +382,33 @@ func (runtime *Runtime) ListSessions(ctx context.Context) ([]SessionInfo, error)
 	return sessions, nil
 }
 
+// track registers a new Session for id, first closing (and waiting for) any
+// Session already tracked for it.
 func (runtime *Runtime) track(id session.ID, meta metadata) (*Session, error) {
+	for {
+		runtime.mu.Lock()
+		if runtime.closed {
+			runtime.mu.Unlock()
+			return nil, ErrClosed
+		}
+		if runtime.sessions[id] == nil {
+			current := &Session{runtime: runtime, id: id, meta: meta}
+			runtime.sessions[id] = current
+			runtime.mu.Unlock()
+			return current, nil
+		}
+		runtime.mu.Unlock()
+		runtime.closeTracked(id)
+	}
+}
+
+func (runtime *Runtime) closeTracked(id session.ID) {
 	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
-	if runtime.closed {
-		return nil, ErrClosed
+	previous := runtime.sessions[id]
+	runtime.mu.Unlock()
+	if previous != nil {
+		_ = previous.Close()
 	}
-	if previous := runtime.sessions[id]; previous != nil {
-		go previous.Close()
-	}
-	current := &Session{runtime: runtime, id: id, meta: meta}
-	runtime.sessions[id] = current
-	return current, nil
 }
 
 func (runtime *Runtime) untrack(current *Session) {
@@ -409,10 +426,11 @@ type Session struct {
 	// promptMu is held for the whole of Prompt; Close waits on it.
 	promptMu sync.Mutex
 
-	mu     sync.Mutex
-	meta   metadata
-	turn   *turn
-	closed bool
+	mu      sync.Mutex
+	meta    metadata
+	turn    *turn
+	closed  bool
+	cancels uint64
 }
 
 // turn is the state of the running Prompt.
@@ -474,6 +492,12 @@ func (current *Session) SetReasoningEffort(effort llm.ReasoningEffort) error {
 	})
 }
 
+func (current *Session) metadata() metadata {
+	current.mu.Lock()
+	defer current.mu.Unlock()
+	return current.meta
+}
+
 func (current *Session) updateMetadata(update func(*metadata) error) error {
 	current.mu.Lock()
 	defer current.mu.Unlock()
@@ -508,11 +532,24 @@ func (current *Session) observe(item sessionstore.Item) {
 	current.turn.failure = response.Response.Failure
 }
 
+// Arrival marks when a prompt request reached the host, relative to Cancel calls.
+type Arrival uint64
+
+// Arrived returns the current Arrival. A prompt started with PromptFrom using
+// it begins cancelled if Cancel is called before the prompt starts, so a
+// cancel the client sent after its prompt is never lost to scheduling.
+func (current *Session) Arrived() Arrival {
+	current.mu.Lock()
+	defer current.mu.Unlock()
+	return Arrival(current.cancels)
+}
+
 // Cancel hard-stops the running Prompt: the model call is interrupted and
 // running operations are canceled, then Prompt returns StopCancelled. It is a
 // no-op when no Prompt is running.
 func (current *Session) Cancel() {
 	current.mu.Lock()
+	current.cancels++
 	active := current.turn
 	if active == nil {
 		current.mu.Unlock()
@@ -567,6 +604,11 @@ func (current *Session) Replay(ctx context.Context, visit func(sessionstore.Item
 //
 // Canceling ctx stops the turn the same way Cancel does, then returns ctx's error.
 func (current *Session) Prompt(ctx context.Context, text string) (TurnResult, error) {
+	return current.PromptFrom(ctx, current.Arrived(), text)
+}
+
+// PromptFrom is Prompt for a request that arrived at arrival; see Arrived.
+func (current *Session) PromptFrom(ctx context.Context, arrival Arrival, text string) (TurnResult, error) {
 	if !current.promptMu.TryLock() {
 		return TurnResult{}, ErrPromptInProgress
 	}
@@ -577,21 +619,23 @@ func (current *Session) Prompt(ctx context.Context, text string) (TurnResult, er
 		current.mu.Unlock()
 		return TurnResult{}, ErrClosed
 	}
-	active := &turn{}
+	active := &turn{cancelled: current.cancels != uint64(arrival)}
 	current.turn = active
-	if current.meta.Title == "" {
-		current.meta.Title = titleFrom(text)
-	}
-	meta := current.meta
 	current.mu.Unlock()
 	defer func() {
 		current.mu.Lock()
 		current.turn = nil
 		current.mu.Unlock()
 	}()
-	if err := current.runtime.saveMetadata(current.id, meta); err != nil {
+	if err := current.updateMetadata(func(meta *metadata) error {
+		if meta.Title == "" {
+			meta.Title = titleFrom(text)
+		}
+		return nil
+	}); err != nil {
 		return TurnResult{}, err
 	}
+	meta := current.metadata()
 	stopWatching := context.AfterFunc(ctx, current.Cancel)
 	defer stopWatching()
 

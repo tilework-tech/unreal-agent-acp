@@ -416,3 +416,31 @@ func TestNotifyWritesNotification(t *testing.T) {
 		t.Fatalf("frame = %v", frame)
 	}
 }
+
+type preparingHandler struct {
+	handlerFuncs
+	events chan string
+}
+
+func (h preparingHandler) PrepareRequest(ctx context.Context, method string, _ json.RawMessage) context.Context {
+	h.events <- "prepare " + method
+	return ctx
+}
+
+func TestPrepareRequestRunsBeforeLaterMessagesAreHandled(t *testing.T) {
+	events := make(chan string, 8)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	handler := preparingHandler{events: events, handlerFuncs: handlerFuncs{
+		request: func(context.Context, string, json.RawMessage) (any, error) {
+			<-release
+			return nil, nil
+		},
+		notification: func(_ context.Context, method string, _ json.RawMessage) { events <- "notify " + method },
+	}}
+	_, p, _ := start(t, handler)
+	p.send(`{"jsonrpc":"2.0","id":1,"method":"session/prompt"}` + "\n" + `{"jsonrpc":"2.0","method":"session/cancel"}`)
+	if first, second := recv(t, events), recv(t, events); first != "prepare session/prompt" || second != "notify session/cancel" {
+		t.Fatalf("events = %q, %q", first, second)
+	}
+}

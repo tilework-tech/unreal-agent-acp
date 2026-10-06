@@ -2,11 +2,12 @@ package acpagent_test
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -242,6 +243,37 @@ func TestSessionCancelDuringCommandMarksToolFailedBeforeResponding(t *testing.T)
 	}
 }
 
+func TestCancelSentRightAfterPromptIsNotLost(t *testing.T) {
+	c := startAgent(t, func(request fakemodel.Request) fakemodel.Reply {
+		if texts := request.UserTexts(); texts[len(texts)-1] == "first" {
+			<-request.Context().Done() // only a delivered cancel ends this turn
+			return fakemodel.Reply{}
+		}
+		return fakemodel.Text("second")
+	})
+	c.initialize()
+	session := c.newSession(t.TempDir())
+
+	// Both frames in one write, so the cancel is read immediately after the prompt.
+	frames := fmt.Sprintf(`{"jsonrpc":"2.0","id":"raw-prompt","method":"session/prompt","params":{"sessionId":%q,"prompt":[{"type":"text","text":"first"}]}}`+"\n"+
+		`{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":%q}}`+"\n", session.SessionId, session.SessionId)
+	if _, err := io.WriteString(c.raw, frames); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		err := c.call(acp.AgentMethodSessionPrompt, textPrompt(session.SessionId, "second"), nil)
+		if err == nil {
+			return
+		}
+		if rpcCode(err) != -32603 || time.Now().After(deadline) {
+			t.Fatalf("the first prompt was never cancelled: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestAbandonedPromptRequestStopsTheTurn(t *testing.T) {
 	requested := make(chan struct{}, 1)
 	abandoned := make(chan struct{}, 1)
@@ -265,7 +297,9 @@ func TestAbandonedPromptRequestStopsTheTurn(t *testing.T) {
 
 	cancel() // sends $/cancel_request for the prompt
 
-	await(t, "prompt to stop", done)
+	if got := await(t, "prompt to stop", done); got.err == nil {
+		t.Fatalf("abandoned prompt returned %+v", got.response)
+	}
 	await(t, "agent to abandon the model call", abandoned)
 	if err := c.call(acp.AgentMethodSessionClose, acp.CloseSessionRequest{SessionId: session.SessionId}, nil); err != nil {
 		t.Fatal(err)
@@ -353,8 +387,17 @@ func TestCloseStopsRunningPromptAndForgetsSession(t *testing.T) {
 
 	c.mustCall(acp.AgentMethodSessionClose, acp.CloseSessionRequest{SessionId: session.SessionId}, nil)
 
-	if got := await(t, "prompt after close", done); got.err == nil && got.response.StopReason != acp.StopReasonCancelled {
-		t.Fatalf("prompt = %+v", got.response)
+	if got := await(t, "prompt after close", done); got.err != nil || got.response.StopReason != acp.StopReasonCancelled {
+		t.Fatalf("prompt = %+v, %v", got.response, got.err)
+	}
+	var failed bool
+	for _, update := range c.received() {
+		if call := update.Update.ToolCallUpdate; call != nil && call.ToolCallId == "call-1" && call.Status != nil && *call.Status == acp.ToolCallStatusFailed {
+			failed = true
+		}
+	}
+	if !failed {
+		t.Fatal("the closed session's running tool call was never reported as failed")
 	}
 	if err := c.call(acp.AgentMethodSessionPrompt, textPrompt(session.SessionId, "again"), nil); rpcCode(err) != -32602 {
 		t.Fatalf("prompt after close err = %v", err)
@@ -362,10 +405,7 @@ func TestCloseStopsRunningPromptAndForgetsSession(t *testing.T) {
 }
 
 func TestSessionsAreIndependent(t *testing.T) {
-	var mu sync.Mutex
 	c := startAgent(t, func(request fakemodel.Request) fakemodel.Reply {
-		mu.Lock()
-		defer mu.Unlock()
 		texts := request.UserTexts()
 		return fakemodel.Text("echo: " + texts[len(texts)-1])
 	})

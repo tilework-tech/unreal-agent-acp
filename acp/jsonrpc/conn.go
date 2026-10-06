@@ -53,6 +53,13 @@ type Handler interface {
 	HandleNotification(ctx context.Context, method string, params json.RawMessage)
 }
 
+// Preparer is optionally implemented by a Handler that must observe requests
+// in arrival order. PrepareRequest runs on the read loop before any later
+// message is handled; the context it returns is passed to HandleRequest.
+type Preparer interface {
+	PrepareRequest(ctx context.Context, method string, params json.RawMessage) context.Context
+}
+
 type Conn struct {
 	reader  io.Reader
 	handler Handler
@@ -190,6 +197,9 @@ func (c *Conn) dispatch(ctx context.Context, line []byte) error {
 }
 
 func (c *Conn) startRequest(ctx context.Context, message frame) {
+	if preparer, ok := c.handler.(Preparer); ok {
+		ctx = preparer.PrepareRequest(ctx, message.Method, message.Params)
+	}
 	requestCtx, cancel := context.WithCancelCause(ctx)
 	key := idKey(message.ID)
 	c.mu.Lock()

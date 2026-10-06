@@ -134,6 +134,27 @@ func (a *agent) HandleRequest(ctx context.Context, method string, params json.Ra
 	}
 }
 
+type arrivalKey struct{}
+
+// PrepareRequest records when a prompt arrived, before any later
+// session/cancel is handled, so that cancel applies to it.
+func (a *agent) PrepareRequest(ctx context.Context, method string, params json.RawMessage) context.Context {
+	if method != acp.AgentMethodSessionPrompt {
+		return ctx
+	}
+	var request struct {
+		SessionID acp.SessionId `json:"sessionId"`
+	}
+	if json.Unmarshal(params, &request) != nil {
+		return ctx
+	}
+	current, err := a.session(request.SessionID)
+	if err != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, arrivalKey{}, current.runtime.Arrived())
+}
+
 func (a *agent) HandleNotification(_ context.Context, method string, params json.RawMessage) {
 	switch method {
 	case acp.AgentMethodSessionCancel:
@@ -283,7 +304,11 @@ func (a *agent) prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	if err != nil {
 		return acp.PromptResponse{}, jsonrpc.ErrInvalidParams(err)
 	}
-	result, err := current.runtime.Prompt(ctx, text)
+	arrival, ok := ctx.Value(arrivalKey{}).(unrealrt.Arrival)
+	if !ok {
+		arrival = current.runtime.Arrived()
+	}
+	result, err := current.runtime.PromptFrom(ctx, arrival, text)
 	if err != nil {
 		return acp.PromptResponse{}, runtimeError(err)
 	}
@@ -295,11 +320,15 @@ func (a *agent) closeSession(_ context.Context, request acp.CloseSessionRequest)
 	if err != nil {
 		return acp.CloseSessionResponse{}, err
 	}
+	// Close first so the cancelled prompt's final updates still reach the client.
+	closeErr := current.runtime.Close()
 	a.mu.Lock()
-	delete(a.sessions, current.runtime.ID())
+	if a.sessions[current.runtime.ID()] == current {
+		delete(a.sessions, current.runtime.ID())
+	}
 	a.mu.Unlock()
-	if err := current.runtime.Close(); err != nil {
-		return acp.CloseSessionResponse{}, err
+	if closeErr != nil {
+		return acp.CloseSessionResponse{}, closeErr
 	}
 	return acp.CloseSessionResponse{}, nil
 }
@@ -357,11 +386,7 @@ func (a *agent) observe(id session.ID, item sessionstore.Item) {
 		return
 	}
 	if status, ok := item.Data.(sessionstore.ToolCallStatus); ok {
-		current.mu.Lock()
-		for _, id := range status.Status.WaitingFor {
-			current.toolCalls[id] = status.CallID
-		}
-		current.mu.Unlock()
+		current.rememberToolCall(status)
 	}
 	for _, update := range current.live.Translate(item) {
 		if update.Kind == translate.UserMessage {
@@ -375,6 +400,26 @@ func (a *agent) notify(id session.ID, update translate.Update) {
 	notification := acp.SessionNotification{SessionId: acp.SessionId(id), Update: toSessionUpdate(update)}
 	if err := a.conn.Notify(context.Background(), acp.ClientMethodSessionUpdate, notification); err != nil {
 		a.logger.Warn("send session/update", "session", id, "error", err)
+	}
+}
+
+func (current *agentSession) rememberToolCall(status sessionstore.ToolCallStatus) {
+	finished := len(status.Operations) != 0
+	for _, value := range status.Operations {
+		switch value.Status {
+		case operation.StatusCompleted, operation.StatusFailed, operation.StatusCanceled:
+		default:
+			finished = false
+		}
+	}
+	current.mu.Lock()
+	defer current.mu.Unlock()
+	for _, id := range status.Status.WaitingFor {
+		if finished {
+			delete(current.toolCalls, id)
+		} else {
+			current.toolCalls[id] = status.CallID
+		}
 	}
 }
 

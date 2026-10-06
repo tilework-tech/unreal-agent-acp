@@ -139,7 +139,7 @@ func (m *manager) Add(value operation.Operation) error {
 	}
 	state, err := operation.DecodeShellState(value)
 	if err != nil {
-		return m.inner.Add(value)
+		return fmt.Errorf("refusing unreadable shell operation %q: %w", value.ID, err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()

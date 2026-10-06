@@ -39,9 +39,11 @@ Path: @/
 - **A prompt turn is fully synchronous before the response.**
 
 ```
-session/prompt (own goroutine in jsonrpc)
+session/prompt
+  -> acpagent.PrepareRequest (read loop, in order): record Session.Arrived()
+  -> own goroutine in jsonrpc
   -> acpagent.prompt: flatten content blocks to one string
-  -> unrealrt.Session.Prompt
+  -> unrealrt.Session.PromptFrom(arrival)
        rebuild coordinator from store; submit settings control, user text, StopWhenIdle
        coordinator.Run (same goroutine) -> LLM call / tool ops
          -> localfile store Append
@@ -51,19 +53,20 @@ session/prompt (own goroutine in jsonrpc)
   -> PromptResponse{stopReason}
 ```
 
-  Because every store append notifies on the prompting goroutine, all `session/update` frames for a turn are written before the `session/prompt` response.
+  Because every store append notifies on the prompting goroutine, all `session/update` frames for a turn are written before the `session/prompt` response. The flip side: a client that stops reading stdout blocks that session's prompt goroutine on the write (and `session/close` waits on that prompt).
 - **Cancellation paths** all end in the same place, an upstream `StopHard` control that interrupts the model call and cancels running operations so they are recorded in the session file:
 
 | Trigger | Path |
 |---|---|
-| `session/cancel` notification | `acpagent.HandleNotification` -> `Session.Cancel` -> prompt returns `cancelled` |
+| `session/cancel` notification | `acpagent.HandleNotification` -> `Session.Cancel` -> prompt returns `cancelled`. A cancel sent right after its prompt is never lost even if handled before the prompt goroutine starts its turn (see "cancel epoch" below) |
 | `$/cancel_request` for the prompt request | jsonrpc cancels the request ctx -> `Prompt` turns ctx cancellation into `Cancel` -> error `-32800` |
-| `session/close` | `Session.Close` cancels, waits for the prompt, untracks |
+| `session/close` | `Session.Close` cancels, waits for the prompt (so its final updates are still sent), untracks, then the agent forgets the session |
 | stdin EOF / signal | `Serve` returns, `Runtime.Close` closes every session |
 
-- **Permissions.** Each ACP session has a `permission.Gate` (modes `ask` and `full-access`). Per prompt, `WrapOperations` wraps the operation manager with the gate. Shell operations in ask mode are held while the agent's Approver issues `session/request_permission` to the client, naming the tool call id the client already displays (learned from `ToolCallStatus.WaitingFor` before the operation is dispatched). Allow-always is remembered for the rest of the in-memory session.
-- **Load and resume.** `session/load` reopens via `ResumeSession`, replays every stored item through a fresh translator and streams the updates before responding. `session/resume` feeds history into the translator silently (so later tool updates refer to known calls) and sends nothing. Neither runs the model; `ResumeSession` deliberately never starts the loop because upstream would auto-answer any unanswered input.
-- **Persistence.** Sessions live in the upstream `localfile` store (`<id>.session.jsonl`) under `$XDG_STATE_HOME/unreal-agent/sessions` (fallback `~/.local/state/...`) unless overridden. A sidecar `<id>.acp.json` holds what the store lacks: cwd, title (first prompt line), model and reasoning effort. Shell operation output goes under `operations/<id>/` in the same directory.
+- **Cancel epoch.** @/acp/jsonrpc handles notifications inline on the read loop but runs each request in its own goroutine, so a `session/cancel` could otherwise be handled before the prompt it targets had a turn. Each `unrealrt.Session` counts `Cancel` calls; the optional `jsonrpc.Preparer` hook lets @/internal/acpagent snapshot that count (`Arrived`) synchronously when `session/prompt` is read, and `PromptFrom` starts the turn already cancelled if the count has moved since. Nothing needs balancing when a prompt later fails validation.
+- **Permissions.** Each ACP session has a `permission.Gate` (modes `ask` and `full-access`). Per prompt, `WrapOperations` wraps the operation manager with the gate. Only shell (Bash) operations are gated; view-image (which can read any path) and skill-use (loading skills from `<cwd>/.harness/skills`) run without approval. Shell operations in ask mode are held while the agent's Approver issues `session/request_permission` to the client, naming the tool call id the client already displays (learned from `ToolCallStatus.WaitingFor` before the operation is dispatched). Allow-always is remembered for the rest of the in-memory session.
+- **Load and resume.** `session/load` reopens via `ResumeSession` (which first closes, and waits for, any already-open `Session` for that id, because two coordinators must never append to the same session file and the upstream store has no per-session lock), replays every stored item through a fresh translator and streams the updates before responding. `session/resume` feeds history into the translator silently (so later tool updates refer to known calls) and sends nothing. Neither runs the model; `ResumeSession` deliberately never starts the loop because upstream would auto-answer any unanswered input.
+- **Persistence.** Sessions live in the upstream `localfile` store (`<id>.session.jsonl`) under `$XDG_STATE_HOME/unreal-agent/sessions` (fallback `~/.local/state/...`) unless overridden. A sidecar `<id>.acp.json` holds what the store lacks: cwd, title (first prompt line), model and reasoning effort. All sidecar writes go through the session lock so concurrent updates (title from a prompt, `set_config_option`) do not overwrite each other. Shell operation output goes under `operations/<id>/` in the same directory.
 
 ### Things to Know
 

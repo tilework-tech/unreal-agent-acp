@@ -35,6 +35,7 @@ var responseDefinitions = map[string]string{
 type client struct {
 	t     *testing.T
 	conn  *jsonrpc.Conn
+	raw   io.Writer // writes frames to the agent without going through conn
 	model *fakemodel.Server
 	store string
 
@@ -95,6 +96,7 @@ func startAgentWithModel(t *testing.T, model *fakemodel.Server, options ...func(
 		t: t, model: model, store: settings.store, notify: make(chan struct{}, 1),
 		permission: settings.permission, cancelled: map[acp.SessionId]chan struct{}{},
 	}
+	c.raw = clientOut
 	c.conn = jsonrpc.NewConn(clientIn, clientOut, c)
 	clientDone := make(chan struct{})
 	go func() {

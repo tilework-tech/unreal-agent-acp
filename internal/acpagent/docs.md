@@ -21,9 +21,10 @@ Path: @/internal/acpagent
 - `session/load` replays every stored item through a fresh translator and sends the updates before responding; `session/resume` feeds the same translator silently. Both reuse that translator for the live session.
 - `session/list` filters by cwd when given, formats `updatedAt` as RFC3339 UTC, and sorts newest first.
 - `session/prompt` flattens content blocks into the single string unreal-agent accepts: text verbatim, resource links as Markdown links, embedded text resources as `<resource uri=...>` blocks, blob resources as an omitted-content placeholder. Image and audio blocks are rejected as invalid params.
-- Live updates: the runtime observer runs on the prompting goroutine, records `ToolCallStatus.WaitingFor` operation ids against their tool call id, translates the item, and writes each update (except user-message echoes) with `Notify` before the prompt returns.
+- `PrepareRequest` (the `jsonrpc.Preparer` hook) runs on the read loop for `session/prompt` and stores the session's `Arrived()` snapshot in the request ctx; `prompt` passes it to `PromptFrom` (falling back to a fresh snapshot). This guarantees a `session/cancel` sent after a prompt cancels it even when the notification is handled before the prompt goroutine starts.
+- Live updates: the runtime observer runs on the prompting goroutine, records `ToolCallStatus.WaitingFor` operation ids against their tool call id (dropping those entries once all of the call's operations are terminal), translates the item, and writes each update (except user-message echoes) with `Notify` before the prompt returns.
 - Permission Approver: issues `session/request_permission` naming the tool call id learned above (the status item is appended before operations are dispatched), with allow-once, allow-always and reject options. A cancelled outcome withdraws the request; an unknown option id is an error.
-- `session/cancel` calls `Session.Cancel`; `session/close` forgets the session and closes it (canceling and waiting for any running prompt). `session/set_config_option` handles `mode`, `model` and `reasoning_effort`; `session/set_mode` sets the gate mode.
+- `session/cancel` calls `Session.Cancel`; `session/close` first closes the runtime session (canceling and waiting for any running prompt, so its final `tool_call_update` frames still reach the client) and only then removes it from the table, if the entry was not already replaced. `session/set_config_option` handles `mode`, `model` and `reasoning_effort`; `session/set_mode` sets the gate mode.
 
 ### Things to Know
 
@@ -37,7 +38,9 @@ Path: @/internal/acpagent
 | prompt request canceled via `$/cancel_request` | `-32800` (from @/acp/jsonrpc) |
 
 - `session/cancel` is a notification handled on the read loop, so it must stay non-blocking; `Session.Cancel` only submits a control.
-- Reopening an already-open session id replaces its entry with a new translator and a new gate, so permission mode resets to `ask`.
+- Reopening an already-open session id closes the old runtime session first (see @/internal/unrealrt), then replaces the entry with a new translator and a new gate, so permission mode resets to `ask`.
+- `Notify` writes happen on the prompting goroutine. A client that stops reading stdout stalls that session's prompt, and `session/close` or a reopen of that session waits on it.
+- Only shell operations go through the permission Approver; view-image and skill-use run without approval.
 - Non-empty `mcpServers` on new/load/resume are accepted and ignored with a stderr warning; MCP is not implemented yet.
 - No `usage_update` is sent and `PromptResponse` has no usage: v1 `usage_update` needs a context-window size the agent does not know.
 - Tests drive the agent through a real `jsonrpc.Conn` client over pipes with the fake model from @/internal/fakemodel, and validate every outbound notification, permission request and response against the pinned schema via @/internal/schemacheck.

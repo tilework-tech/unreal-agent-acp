@@ -460,7 +460,9 @@ func TestSessionSurvivesRuntimeRestart(t *testing.T) {
 	s.SetReasoningEffort(llm.ReasoningEffortMedium)
 	prompt(t, s, "titled prompt")
 	var before int
-	s.Replay(t.Context(), func(sessionstore.Item) error { before++; return nil })
+	if err := s.Replay(t.Context(), func(sessionstore.Item) error { before++; return nil }); err != nil {
+		t.Fatal(err)
+	}
 	if err := f.runtime.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +485,9 @@ func TestSessionSurvivesRuntimeRestart(t *testing.T) {
 		t.Fatalf("resumed model=%q effort=%q title=%q cwd=%q", resumed.Model(), resumed.ReasoningEffort(), resumed.Title(), resumed.Cwd())
 	}
 	var replayed int
-	resumed.Replay(t.Context(), func(sessionstore.Item) error { replayed++; return nil })
+	if err := resumed.Replay(t.Context(), func(sessionstore.Item) error { replayed++; return nil }); err != nil {
+		t.Fatal(err)
+	}
 	if replayed != before {
 		t.Fatalf("replay after restart yielded %d items, want %d", replayed, before)
 	}
@@ -647,5 +651,61 @@ func TestCloseStopsRunningPromptAndRejectsNewOnes(t *testing.T) {
 	assertProcessGone(t, pid)
 	if _, err := s.Prompt(t.Context(), "again"); !errors.Is(err, unrealrt.ErrClosed) {
 		t.Fatalf("Prompt after Close err = %v", err)
+	}
+}
+
+func TestCancelBetweenArrivalAndStartAppliesToThePrompt(t *testing.T) {
+	f := newFixture(t, func(request fakemodel.Request) fakemodel.Reply {
+		<-request.Context().Done()
+		return fakemodel.Reply{}
+	})
+	s := f.newSession(t)
+	arrival := s.Arrived()
+	s.Cancel()
+
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := s.PromptFrom(t.Context(), arrival, "never runs")
+		done <- outcome{result, err}
+	}()
+	got := await(t, "prompt cancelled before it started", done)
+	if got.err != nil || got.result.Stop != unrealrt.StopCancelled {
+		t.Fatalf("Prompt = %+v, %v", got.result, got.err)
+	}
+}
+
+func TestCancelBeforeArrivalDoesNotAffectThePrompt(t *testing.T) {
+	f := newFixture(t, fakemodel.Sequence(fakemodel.Text("ok")))
+	s := f.newSession(t)
+	s.Cancel()
+	if result := prompt(t, s, "hello"); result.Stop != unrealrt.StopEndTurn {
+		t.Fatalf("stop = %q", result.Stop)
+	}
+}
+
+func TestResumingASessionWithARunningPromptStopsItFirst(t *testing.T) {
+	f := newFixture(t, fakemodel.Sequence(
+		fakemodel.ToolCall("call-1", "Bash", map[string]any{"command": startSleeper}),
+		fakemodel.Text("after resume"),
+	))
+	original := f.newSession(t)
+	done := promptAsync(t.Context(), original, "sleep")
+	pid := sleeperPID(t, f.cwd)
+
+	resumed, err := f.runtime.ResumeSession(t.Context(), original.ID(), unrealrt.Options{Cwd: f.cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("ResumeSession returned while the previous prompt was still running")
+	}
+	assertProcessGone(t, pid)
+	if result := prompt(t, resumed, "continue"); result.Stop != unrealrt.StopEndTurn {
+		t.Fatalf("stop = %q", result.Stop)
+	}
+	if err := resumed.Replay(t.Context(), func(sessionstore.Item) error { return nil }); err != nil {
+		t.Fatalf("session file unreadable after resume: %v", err)
 	}
 }

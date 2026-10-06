@@ -4,7 +4,7 @@ Path: @/internal/permission
 
 ### Overview
 
-- Gates shell operations behind user approval by wrapping an upstream `operation.Manager`.
+- Gates shell (Bash) operations behind user approval by wrapping an upstream `operation.Manager`. Other operation types, including view-image (reads any path) and skill-use (loads skills from `<cwd>/.harness/skills`), are not gated.
 - A `Gate` holds one session's policy: mode (`ask` or `full-access`) and whether the user chose "allow always". `Gate.Wrap` produces a per-prompt manager that enforces it.
 - ACP-free: the user is reached through an `Approver` interface that @/internal/acpagent implements with `session/request_permission`.
 
@@ -16,7 +16,7 @@ Path: @/internal/permission
 
 ### Core Implementation
 
-- `Add`: non-shell operations, or any operation when the gate already allows (full access or allow-always), go straight to the inner manager. A shell operation in ask mode is held and an Approver is called in a goroutine, so `Add` never blocks the coordinator loop and several commands can await approval at once.
+- `Add`: non-shell operations, or any operation when the gate already allows (full access or allow-always), go straight to the inner manager. A shell operation in ask mode whose shell state cannot be decoded is refused (`Add` returns an error) rather than passed through unapproved. Otherwise it is held and an Approver is called in a goroutine, so `Add` never blocks the coordinator loop and several commands can await approval at once.
 - Decision handling: allow-once/allow-always forward the held operation to the inner manager (allow-always also flips the gate for the rest of the session, covering all later shell commands); reject finishes it as failed with "The user rejected this command."; a withdrawn request finishes it as canceled; an Approver error finishes it as failed.
 - `Cancel` of a held operation cancels the Approver's context and emits a canceled terminal state; otherwise it delegates to the inner manager.
 - A forwarding goroutine merges inner updates with synthetic terminal states into the wrapper's `Updates` channel. When the inner manager shuts down (prompt ended), the wrapper closes its channel and withdraws every outstanding approval.
