@@ -1,0 +1,124 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/tilework-tech/unreal-agent-acp/internal/fakemodel"
+)
+
+func TestMain(m *testing.M) {
+	if os.Getenv("UNREAL_AGENT_ACP_TEST_RUN_MAIN") == "1" {
+		main()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+// TestStdioSessionRoundTrip runs the real binary entrypoint as a subprocess and
+// checks that stdout carries only JSON-RPC frames.
+func TestStdioSessionRoundTrip(t *testing.T) {
+	model := fakemodel.Start(t, fakemodel.Sequence(fakemodel.Text("hello over stdio")))
+	command := exec.Command(os.Args[0], "-test.run=^$")
+	command.Env = append(os.Environ(), "UNREAL_AGENT_ACP_TEST_RUN_MAIN=1", "UNREAL_AGENT_ACP_SESSION_DIRECTORY="+t.TempDir())
+	for name, value := range model.Env() {
+		command.Env = append(command.Env, name+"="+value)
+	}
+	var stderr strings.Builder
+	command.Stderr = &stderr
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 64)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	send := func(line string) {
+		if _, err := io.WriteString(stdin, line+"\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// next returns the next frame, failing on anything that is not JSON-RPC.
+	next := func() map[string]json.RawMessage {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatalf("stdout closed; stderr:\n%s", stderr.String())
+			}
+			var frame map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(line), &frame); err != nil || string(frame["jsonrpc"]) != `"2.0"` {
+				t.Fatalf("non-JSON-RPC output on stdout: %q", line)
+			}
+			return frame
+		case <-time.After(20 * time.Second):
+			t.Fatalf("timed out; stderr:\n%s", stderr.String())
+			return nil
+		}
+	}
+
+	send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`)
+	if frame := next(); frame["result"] == nil {
+		t.Fatalf("initialize = %v", frame)
+	}
+	send(fmt.Sprintf(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":%q,"mcpServers":[]}}`, t.TempDir()))
+	var created struct {
+		Result struct {
+			SessionID string `json:"sessionId"`
+		} `json:"result"`
+	}
+	frame := next()
+	encoded, _ := json.Marshal(frame)
+	json.Unmarshal(encoded, &created)
+	if created.Result.SessionID == "" {
+		t.Fatalf("session/new = %v", frame)
+	}
+	send(fmt.Sprintf(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":%q,"prompt":[{"type":"text","text":"hi"}]}}`, created.Result.SessionID))
+	var sawText bool
+	for {
+		frame := next()
+		if string(frame["method"]) == `"session/update"` && strings.Contains(string(frame["params"]), "hello over stdio") {
+			sawText = true
+		}
+		if string(frame["id"]) == "3" {
+			if !strings.Contains(string(frame["result"]), `"end_turn"`) {
+				t.Fatalf("prompt response = %v", frame)
+			}
+			break
+		}
+	}
+	if !sawText {
+		t.Fatal("agent message was not streamed")
+	}
+
+	stdin.Close()
+	exited := make(chan error, 1)
+	go func() { exited <- command.Wait() }()
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("agent exited with %v; stderr:\n%s", err, stderr.String())
+		}
+	case <-time.After(15 * time.Second):
+		command.Process.Kill()
+		t.Fatal("agent did not exit when stdin closed")
+	}
+}
