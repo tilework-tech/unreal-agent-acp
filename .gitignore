@@ -1,3 +1,4 @@
 /.cache/
 /bin/
 /.gocache/
+/.local/
