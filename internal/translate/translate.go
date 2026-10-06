@@ -130,11 +130,15 @@ func (s *Session) translateResponse(response llm.Response) []Update {
 
 func (s *Session) translateStatus(status sessionstore.ToolCallStatus) []Update {
 	current, output := result(s.calls[status.CallID], status)
-	if previous, seen := s.reported[status.CallID]; seen && previous == current && current == StatusInProgress {
+	if previous, seen := s.reported[status.CallID]; seen && previous == current && !terminal(current) {
 		return nil
 	}
 	s.reported[status.CallID] = current
 	return []Update{{Kind: ToolCallUpdated, Tool: &Tool{CallID: status.CallID, Status: current, Output: output}}}
+}
+
+func terminal(status ToolStatus) bool {
+	return status == StatusCompleted || status == StatusFailed
 }
 
 func started(call llm.ToolCall) *Tool {
@@ -173,22 +177,29 @@ func result(call llm.ToolCall, status sessionstore.ToolCallStatus) (ToolStatus, 
 	if status.Status.Error != "" && len(status.Operations) == 0 {
 		return StatusFailed, "Error: " + status.Status.Error
 	}
-	current := StatusCompleted
+	failed, running, waiting := false, false, false
 	for _, value := range status.Operations {
 		switch value.Status {
 		case operation.StatusFailed, operation.StatusCanceled:
-			if current != StatusInProgress {
-				current = StatusFailed
-			}
+			failed = true
 		case operation.StatusCompleted:
+		case operation.StatusReady:
+			// Not started yet, for example while awaiting the user's approval.
+			waiting = true
 		default:
-			current = StatusInProgress
+			running = true
 		}
 	}
-	if current == StatusInProgress {
-		return current, ""
+	switch {
+	case running:
+		return StatusInProgress, ""
+	case waiting:
+		return StatusPending, ""
+	case failed:
+		return StatusFailed, outputText(call, status)
+	default:
+		return StatusCompleted, outputText(call, status)
 	}
-	return current, outputText(call, status)
 }
 
 // outputText renders what the model sees for a finished call.

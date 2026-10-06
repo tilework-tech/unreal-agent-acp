@@ -14,16 +14,20 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/unreallabsai/unreal-agent/harness/llm"
+	"github.com/unreallabsai/unreal-agent/harness/operation"
 	"github.com/unreallabsai/unreal-agent/harness/session"
 	"github.com/unreallabsai/unreal-agent/harness/sessionstore"
 
 	"github.com/tilework-tech/unreal-agent-acp/acp/jsonrpc"
 	acp "github.com/tilework-tech/unreal-agent-acp/acp/v1"
+	"github.com/tilework-tech/unreal-agent-acp/internal/permission"
 	"github.com/tilework-tech/unreal-agent-acp/internal/translate"
 	"github.com/tilework-tech/unreal-agent-acp/internal/unrealrt"
 )
@@ -31,9 +35,19 @@ import (
 const (
 	configModel           = "model"
 	configReasoningEffort = "reasoning_effort"
+	configMode            = "mode"
+
+	optionAllowOnce   = "allow_once"
+	optionAllowAlways = "allow_always"
+	optionRejectOnce  = "reject_once"
 
 	codeAuthRequired = -32000
 )
+
+var modes = []acp.SessionMode{
+	{Id: acp.SessionModeId(permission.Ask), Name: "Ask", Description: ptr("Ask before running shell commands")},
+	{Id: acp.SessionModeId(permission.FullAccess), Name: "Full access", Description: ptr("Run shell commands without asking")},
+}
 
 var reasoningEfforts = []llm.ReasoningEffort{
 	llm.ReasoningEffortLow, llm.ReasoningEffortMedium, llm.ReasoningEffortHigh,
@@ -64,9 +78,15 @@ type agent struct {
 
 type agentSession struct {
 	runtime *unrealrt.Session
+	gate    *permission.Gate
 	// live translates items as they are appended; only the prompting
 	// goroutine touches it.
 	live *translate.Session
+
+	mu sync.Mutex
+	// toolCalls maps operation IDs to the tool call that submitted them, so
+	// permission requests can name the tool call the client already shows.
+	toolCalls map[operation.ID]string
 }
 
 // Serve runs an ACP agent over r and w until r ends or ctx is done.
@@ -78,6 +98,7 @@ func Serve(ctx context.Context, r io.Reader, w io.Writer, config Config) error {
 	a := &agent{config: config, logger: logger, sessions: map[session.ID]*agentSession{}}
 	runtimeConfig := config.Runtime
 	runtimeConfig.Observer = a.observe
+	runtimeConfig.WrapOperations = a.wrapOperations
 	runtime, err := unrealrt.New(runtimeConfig)
 	if err != nil {
 		return err
@@ -100,6 +121,14 @@ func (a *agent) HandleRequest(ctx context.Context, method string, params json.Ra
 		return handle(ctx, params, a.closeSession)
 	case acp.AgentMethodSessionSetConfigOption:
 		return handle(ctx, params, a.setConfigOption)
+	case acp.AgentMethodSessionSetMode:
+		return handle(ctx, params, a.setMode)
+	case acp.AgentMethodSessionLoad:
+		return handle(ctx, params, a.loadSession)
+	case acp.AgentMethodSessionResume:
+		return handle(ctx, params, a.resumeSession)
+	case acp.AgentMethodSessionList:
+		return handle(ctx, params, a.listSessions)
 	default:
 		return nil, jsonrpc.ErrMethodNotFound(method)
 	}
@@ -141,9 +170,12 @@ func (a *agent) initialize(_ context.Context, request acp.InitializeRequest) (ac
 		AgentInfo:       &acp.Implementation{Name: a.config.Name, Version: a.config.Version},
 		AuthMethods:     []acp.AuthMethod{},
 		AgentCapabilities: acp.AgentCapabilities{
+			LoadSession:        true,
 			PromptCapabilities: acp.PromptCapabilities{EmbeddedContext: true},
 			SessionCapabilities: acp.SessionCapabilities{
-				Close: &acp.SessionCloseCapabilities{},
+				Close:  &acp.SessionCloseCapabilities{},
+				List:   &acp.SessionListCapabilities{},
+				Resume: &acp.SessionResumeCapabilities{},
 			},
 		},
 	}, nil
@@ -157,11 +189,89 @@ func (a *agent) newSession(ctx context.Context, request acp.NewSessionRequest) (
 	if err != nil {
 		return acp.NewSessionResponse{}, runtimeError(err)
 	}
-	a.track(created, translate.NewSession())
+	current := a.track(created, translate.NewSession())
 	return acp.NewSessionResponse{
 		SessionId:     acp.SessionId(created.ID()),
-		ConfigOptions: a.configOptions(created),
+		ConfigOptions: a.configOptions(current),
+		Modes:         modeState(current),
 	}, nil
+}
+
+// loadSession streams the session's history as session/update notifications
+// before responding.
+func (a *agent) loadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	current, err := a.reopen(ctx, request.SessionId, request.Cwd, len(request.McpServers), true)
+	if err != nil {
+		return acp.LoadSessionResponse{}, err
+	}
+	return acp.LoadSessionResponse{ConfigOptions: a.configOptions(current), Modes: modeState(current)}, nil
+}
+
+func (a *agent) resumeSession(ctx context.Context, request acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
+	current, err := a.reopen(ctx, request.SessionId, request.Cwd, len(request.McpServers), false)
+	if err != nil {
+		return acp.ResumeSessionResponse{}, err
+	}
+	return acp.ResumeSessionResponse{ConfigOptions: a.configOptions(current), Modes: modeState(current)}, nil
+}
+
+func (a *agent) reopen(ctx context.Context, id acp.SessionId, cwd string, mcpServers int, replay bool) (*agentSession, error) {
+	if mcpServers != 0 {
+		a.logger.Warn("MCP servers are not supported yet; ignoring them", "count", mcpServers)
+	}
+	reopened, err := a.runtime.ResumeSession(ctx, session.ID(id), unrealrt.Options{Cwd: cwd})
+	if err != nil {
+		return nil, runtimeError(err)
+	}
+	// The translator sees the whole history so later updates refer to known tool calls.
+	live := translate.NewSession()
+	if err := reopened.Replay(ctx, func(item sessionstore.Item) error {
+		for _, update := range live.Translate(item) {
+			if replay {
+				a.notify(reopened.ID(), update)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return a.track(reopened, live), nil
+}
+
+func (a *agent) listSessions(ctx context.Context, request acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
+	stored, err := a.runtime.ListSessions(ctx)
+	if err != nil {
+		return acp.ListSessionsResponse{}, err
+	}
+	slices.SortStableFunc(stored, func(left, right unrealrt.SessionInfo) int {
+		return right.UpdatedAt.Compare(left.UpdatedAt)
+	})
+	sessions := make([]acp.SessionInfo, 0, len(stored))
+	for _, info := range stored {
+		if request.Cwd != nil && filepath.Clean(*request.Cwd) != info.Cwd {
+			continue
+		}
+		entry := acp.SessionInfo{SessionId: acp.SessionId(info.ID), Cwd: info.Cwd}
+		if info.Title != "" {
+			entry.Title = ptr(info.Title)
+		}
+		if !info.UpdatedAt.IsZero() {
+			entry.UpdatedAt = ptr(info.UpdatedAt.UTC().Format(time.RFC3339))
+		}
+		sessions = append(sessions, entry)
+	}
+	return acp.ListSessionsResponse{Sessions: sessions}, nil
+}
+
+func (a *agent) setMode(_ context.Context, request acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+	current, err := a.session(request.SessionId)
+	if err != nil {
+		return acp.SetSessionModeResponse{}, err
+	}
+	if err := current.gate.SetMode(permission.Mode(request.ModeId)); err != nil {
+		return acp.SetSessionModeResponse{}, jsonrpc.ErrInvalidParams(err)
+	}
+	return acp.SetSessionModeResponse{}, nil
 }
 
 func (a *agent) prompt(ctx context.Context, request acp.PromptRequest) (acp.PromptResponse, error) {
@@ -208,17 +318,20 @@ func (a *agent) setConfigOption(_ context.Context, request acp.SetSessionConfigO
 		err = current.runtime.SetModel(value)
 	case configReasoningEffort:
 		err = current.runtime.SetReasoningEffort(llm.ReasoningEffort(value))
+	case configMode:
+		err = current.gate.SetMode(permission.Mode(value))
 	default:
 		err = fmt.Errorf("unknown config option %q", request.ValueId.ConfigId)
 	}
 	if err != nil {
 		return acp.SetSessionConfigOptionResponse{}, jsonrpc.ErrInvalidParams(err)
 	}
-	return acp.SetSessionConfigOptionResponse{ConfigOptions: a.configOptions(current.runtime)}, nil
+	return acp.SetSessionConfigOptionResponse{ConfigOptions: a.configOptions(current)}, nil
 }
 
 func (a *agent) track(runtimeSession *unrealrt.Session, live *translate.Session) *agentSession {
-	current := &agentSession{runtime: runtimeSession, live: live}
+	current := &agentSession{runtime: runtimeSession, live: live, toolCalls: map[operation.ID]string{}}
+	current.gate = permission.NewGate(runtimeSession.ID(), approver{agent: a, session: current})
 	a.mu.Lock()
 	a.sessions[runtimeSession.ID()] = current
 	a.mu.Unlock()
@@ -243,6 +356,13 @@ func (a *agent) observe(id session.ID, item sessionstore.Item) {
 	if current == nil {
 		return
 	}
+	if status, ok := item.Data.(sessionstore.ToolCallStatus); ok {
+		current.mu.Lock()
+		for _, id := range status.Status.WaitingFor {
+			current.toolCalls[id] = status.CallID
+		}
+		current.mu.Unlock()
+	}
 	for _, update := range current.live.Translate(item) {
 		if update.Kind == translate.UserMessage {
 			continue // the client already shows what it sent
@@ -258,7 +378,79 @@ func (a *agent) notify(id session.ID, update translate.Update) {
 	}
 }
 
-func (a *agent) configOptions(current *unrealrt.Session) []acp.SessionConfigOption {
+// wrapOperations gates each prompt's operations with its session's policy.
+func (a *agent) wrapOperations(id session.ID, inner operation.Manager) operation.Manager {
+	a.mu.Lock()
+	current := a.sessions[id]
+	a.mu.Unlock()
+	if current == nil {
+		return permission.NewGate(id, denyAll{}).Wrap(inner)
+	}
+	return current.gate.Wrap(inner)
+}
+
+// approver asks the client through session/request_permission.
+type approver struct {
+	agent   *agent
+	session *agentSession
+}
+
+func (p approver) Approve(ctx context.Context, request permission.Request) (permission.Decision, error) {
+	p.session.mu.Lock()
+	callID, known := p.session.toolCalls[request.OperationID]
+	p.session.mu.Unlock()
+	if !known {
+		callID = string(request.OperationID)
+	}
+	kind := acp.ToolKindExecute
+	status := acp.ToolCallStatusPending
+	var response acp.RequestPermissionResponse
+	if err := p.agent.conn.Call(ctx, acp.ClientMethodSessionRequestPermission, acp.RequestPermissionRequest{
+		SessionId: acp.SessionId(request.SessionID),
+		ToolCall: acp.ToolCallUpdate{
+			ToolCallId: acp.ToolCallId(callID),
+			Title:      ptr(request.Command),
+			Kind:       &kind,
+			Status:     &status,
+			RawInput:   map[string]any{"command": request.Command},
+		},
+		Options: []acp.PermissionOption{
+			{OptionId: optionAllowOnce, Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
+			{OptionId: optionAllowAlways, Name: "Allow all commands in this session", Kind: acp.PermissionOptionKindAllowAlways},
+			{OptionId: optionRejectOnce, Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce},
+		},
+	}, &response); err != nil {
+		return permission.Cancelled, err
+	}
+	if response.Outcome.Selected == nil {
+		return permission.Cancelled, nil
+	}
+	switch response.Outcome.Selected.OptionId {
+	case optionAllowOnce:
+		return permission.AllowOnce, nil
+	case optionAllowAlways:
+		return permission.AllowAlways, nil
+	case optionRejectOnce:
+		return permission.Reject, nil
+	default:
+		return permission.Cancelled, fmt.Errorf("client selected unknown permission option %q", response.Outcome.Selected.OptionId)
+	}
+}
+
+type denyAll struct{}
+
+func (denyAll) Approve(context.Context, permission.Request) (permission.Decision, error) {
+	return permission.Reject, nil
+}
+
+func modeState(current *agentSession) *acp.SessionModeState {
+	return &acp.SessionModeState{CurrentModeId: acp.SessionModeId(current.gate.Mode()), AvailableModes: modes}
+}
+
+func ptr[T any](value T) *T { return &value }
+
+func (a *agent) configOptions(session *agentSession) []acp.SessionConfigOption {
+	current := session.runtime
 	model := current.Model()
 	models := slices.Clone(a.config.Models)
 	if !slices.Contains(models, model) {
@@ -272,9 +464,19 @@ func (a *agent) configOptions(current *unrealrt.Session) []acp.SessionConfigOpti
 	for _, effort := range reasoningEfforts {
 		effortOptions = append(effortOptions, acp.SessionConfigSelectOption{Value: acp.SessionConfigValueId(effort), Name: string(effort)})
 	}
+	modeOptions := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(modes))
+	for _, mode := range modes {
+		modeOptions = append(modeOptions, acp.SessionConfigSelectOption{Value: acp.SessionConfigValueId(mode.Id), Name: mode.Name, Description: mode.Description})
+	}
+	modeCategory := acp.SessionConfigOptionCategoryMode
 	modelCategory := acp.SessionConfigOptionCategoryModel
 	effortCategory := acp.SessionConfigOptionCategoryThoughtLevel
 	return []acp.SessionConfigOption{
+		{Select: &acp.SessionConfigOptionSelect{
+			Id: configMode, Name: "Permissions", Category: &modeCategory,
+			CurrentValue: acp.SessionConfigValueId(session.gate.Mode()),
+			Options:      acp.SessionConfigSelectOptions{Ungrouped: &modeOptions},
+		}},
 		{Select: &acp.SessionConfigOptionSelect{
 			Id: configModel, Name: "Model", Category: &modelCategory,
 			CurrentValue: acp.SessionConfigValueId(model),

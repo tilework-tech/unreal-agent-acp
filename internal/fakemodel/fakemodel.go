@@ -170,13 +170,20 @@ func Start(t interface {
 }, handler func(Request) Reply,
 ) *Server {
 	t.Helper()
-	server := &Server{}
-	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		server.serve(w, r, handler)
-	}))
+	server, httpHandler := New(handler)
+	httpServer := httptest.NewServer(httpHandler)
 	t.Cleanup(httpServer.Close)
 	server.URL = httpServer.URL
 	return server
+}
+
+// New returns a server whose HTTP handler answers POST /responses with handler.
+// The caller serves the handler and sets URL.
+func New(handler func(Request) Reply) (*Server, http.Handler) {
+	server := &Server{}
+	return server, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server.serve(w, r, handler)
+	})
 }
 
 // Requests returns every request received so far.

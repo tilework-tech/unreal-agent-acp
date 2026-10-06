@@ -108,8 +108,11 @@ func TestBashCallLifecycle(t *testing.T) {
 	input := operation.ShellInput{Command: "ls -la", Shell: "/bin/sh", Directory: "/w"}
 	updates := translateAll(
 		modelResponse("resp-1", call("call-1", "Bash", `{"command":"ls -la"}`)),
+		// Ready operations have not started (they may be awaiting approval).
 		toolStatus("call-1", tool.CallStatus{WaitingFor: []operation.ID{"op-1"}},
 			shellOperation(t, "op-1", operation.StatusReady, operation.ShellState{Input: input})),
+		toolStatus("call-1", tool.CallStatus{WaitingFor: []operation.ID{"op-1"}},
+			shellOperation(t, "op-1", operation.StatusAwaiting, operation.ShellState{Input: input})),
 		toolStatus("call-1", tool.CallStatus{WaitingFor: []operation.ID{"op-1"}},
 			shellOperation(t, "op-1", operation.StatusCompleted, operation.ShellState{Input: input, Result: &operation.ShellResult{Out: "file-a\nfile-b\n"}})),
 	)
@@ -247,7 +250,7 @@ func TestStatusForUnseenCallIsStillReported(t *testing.T) {
 
 func TestRepeatedIdenticalStatusIsNotReportedTwice(t *testing.T) {
 	running := toolStatus("call-1", tool.CallStatus{WaitingFor: []operation.ID{"op-1"}},
-		shellOperation(t, "op-1", operation.StatusReady, operation.ShellState{}))
+		shellOperation(t, "op-1", operation.StatusAwaiting, operation.ShellState{}))
 	updates := translateAll(modelResponse("resp-1", call("call-1", "Bash", `{"command":"x"}`)), running, running)
 	if len(updates) != 2 {
 		t.Fatalf("updates = %+v", updates)

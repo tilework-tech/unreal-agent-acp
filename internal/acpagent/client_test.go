@@ -47,6 +47,9 @@ type client struct {
 	permission func(context.Context, acp.RequestPermissionRequest) acp.RequestPermissionResponse
 	permMu     sync.Mutex
 	asked      []acp.RequestPermissionRequest
+	// cancelled is closed per session by cancel, as a spec-compliant client
+	// answers its pending permission requests with "cancelled".
+	cancelled map[acp.SessionId]chan struct{}
 }
 
 type clientOptions struct {
@@ -88,7 +91,10 @@ func startAgentWithModel(t *testing.T, model *fakemodel.Server, options ...func(
 		agentOut.Close()
 	}()
 
-	c := &client{t: t, model: model, store: settings.store, notify: make(chan struct{}, 1), permission: settings.permission}
+	c := &client{
+		t: t, model: model, store: settings.store, notify: make(chan struct{}, 1),
+		permission: settings.permission, cancelled: map[acp.SessionId]chan struct{}{},
+	}
 	c.conn = jsonrpc.NewConn(clientIn, clientOut, c)
 	clientDone := make(chan struct{})
 	go func() {
@@ -121,11 +127,21 @@ func (c *client) HandleRequest(ctx context.Context, method string, params json.R
 		c.permMu.Lock()
 		c.asked = append(c.asked, request)
 		answer := c.permission
+		cancelled := c.cancelSignal(request.SessionId)
 		c.permMu.Unlock()
 		if answer == nil {
 			return selectKind(request, acp.PermissionOptionKindAllowOnce), nil
 		}
-		return answer(ctx, request), nil
+		answered := make(chan acp.RequestPermissionResponse, 1)
+		go func() { answered <- answer(ctx, request) }()
+		select {
+		case response := <-answered:
+			return response, nil
+		case <-cancelled:
+			return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	default:
 		return nil, jsonrpc.ErrMethodNotFound(method)
 	}
@@ -231,8 +247,22 @@ func (c *client) promptAsync(ctx context.Context, sessionID acp.SessionId, text 
 	return done
 }
 
+// cancelSignal must be called with permMu held.
+func (c *client) cancelSignal(sessionID acp.SessionId) chan struct{} {
+	signal, ok := c.cancelled[sessionID]
+	if !ok {
+		signal = make(chan struct{})
+		c.cancelled[sessionID] = signal
+	}
+	return signal
+}
+
 func (c *client) cancel(sessionID acp.SessionId) {
 	c.t.Helper()
+	c.permMu.Lock()
+	close(c.cancelSignal(sessionID))
+	c.cancelled[sessionID] = make(chan struct{})
+	c.permMu.Unlock()
 	if err := c.conn.Notify(context.Background(), acp.AgentMethodSessionCancel, acp.CancelNotification{SessionId: sessionID}); err != nil {
 		c.t.Fatal(err)
 	}
