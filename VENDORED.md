@@ -43,6 +43,12 @@ These need upstream changes; they are not worked around here.
   sidecar `<id>.acp.json` next to each session file (`internal/unrealrt/metadata.go`, ours, not vendored).
 - **Long-lived coordinator.** `coordinator.Run` is single-use, so each prompt
   re-reads the session file and rebuilds the coordinator from it.
+- **Compaction for unknown models.** A model missing from the settings catalog
+  has compaction threshold 0, so upstream compacts whenever more than 20,000
+  tokens are in context. Custom models need a `settings.json` entry.
+- **No token refresh.** Codex access tokens are never refreshed; something
+  outside the agent must keep `auth.json` current. We build an LLM client per
+  prompt so the rewritten file is picked up.
 - **Per-session environment.** `operation.ShellInput` has no environment, so
   every session shares the agent process environment.
 
@@ -55,9 +61,12 @@ Not upstream limitations; recorded so they are not mistaken for bugs.
   implemented yet.
 - **Permission policy is in memory.** Permission mode and "allow always" reset
   to `ask` on `session/load`, `session/resume`, or process restart.
-- **No usage reporting.** ACP v1 `usage_update` requires a context-window size
-  the agent does not know, and v1 `PromptResponse` has no usage field, so
-  per-turn usage (summed in `unrealrt.TurnResult`) is not sent.
+- **No usage reporting.** ACP v1 `usage_update` requires a context-window size,
+  which is known only for models in the upstream settings catalog, and v1
+  `PromptResponse` has no usage field, so per-turn usage (summed in
+  `unrealrt.TurnResult`) is not sent.
+- **No compaction notice.** Compaction summaries are hidden from the client and
+  nothing tells it that context was compacted.
 - **Images and audio.** Prompt image/audio content blocks are rejected as
   invalid params; unreal-agent takes a single text input per prompt.
 
