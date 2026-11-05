@@ -18,6 +18,8 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/unreallabsai/unreal-agent/cmd/internal/providers"
+	"github.com/unreallabsai/unreal-agent/cmd/internal/xdgpath"
 	"github.com/unreallabsai/unreal-agent/harness/contextbuilder"
 	"github.com/unreallabsai/unreal-agent/harness/coordinator"
 	"github.com/unreallabsai/unreal-agent/harness/inbox"
@@ -27,6 +29,7 @@ import (
 	"github.com/unreallabsai/unreal-agent/harness/session"
 	"github.com/unreallabsai/unreal-agent/harness/sessionstore"
 	"github.com/unreallabsai/unreal-agent/harness/sessionstore/localfile"
+	"github.com/unreallabsai/unreal-agent/harness/settings"
 	"github.com/unreallabsai/unreal-agent/harness/tool"
 	"github.com/unreallabsai/unreal-agent/harness/tool/bash"
 	"github.com/unreallabsai/unreal-agent/harness/tool/viewimage"
@@ -34,8 +37,6 @@ import (
 
 const (
 	defaultProvider           = "openai"
-	defaultSessionDirectory   = "unreal-agent/sessions"
-	llmAPIKeyEnvironment      = "UNREAL_HARNESS_LLM_API_KEY"
 	llmBaseURLEnvironment     = "UNREAL_HARNESS_LLM_BASE_URL"
 	llmModelEnvironment       = "UNREAL_HARNESS_LLM_MODEL"
 	llmProviderEnvironment    = "UNREAL_HARNESS_LLM_PROVIDER"
@@ -49,24 +50,12 @@ const defaultSystemPrompt = `You are an AI agent running inside an isolated sand
 - For large datasets, inspect a sample first before processing everything.
 `
 
-type Client interface {
-	llm.Adapter
-	Close() error
-}
-
-type Provider struct {
-	Name              string
-	BaseURL           string
-	DefaultModel      string
-	APIKeyEnvironment string // Empty delegates authentication to NewClient.
-	NewClient         func(apiKey, baseURL string, maxAttempts int, getenv func(string) string) (Client, error)
-}
-
 type Request struct {
 	Messages               []RequestMessage `json:"messages"`
 	Prompt                 *string          `json:"prompt"`
 	SystemPrompt           *string          `json:"system_prompt"`
 	Model                  string           `json:"model"`
+	MaxOutputTokens        *int64           `json:"max_output_tokens"`
 	MaxAttempts            *int             `json:"max_attempts"`
 	SessionID              *string          `json:"session_id"`
 	ThinkingLevel          string           `json:"thinking_level"`
@@ -201,6 +190,12 @@ func Run(
 		input = bytes.NewReader(encoded)
 	} else if flags.NArg() == 1 {
 		input = strings.NewReader(flags.Arg(0))
+	} else {
+		raw, err := readInput(ctx, input)
+		if err != nil {
+			return fmt.Errorf("read input: %w", err)
+		}
+		input = bytes.NewReader(raw)
 	}
 	parsed, newTools, err := config.ParseRequest(input)
 	if err != nil {
@@ -241,7 +236,7 @@ func Run(
 	if providerName == "" {
 		providerName = defaultProvider
 	}
-	selected, err := selectProvider(config.Providers, providerName)
+	selected, err := providers.Find(config.Providers, providerName)
 	if err != nil {
 		return err
 	}
@@ -260,19 +255,9 @@ func Run(
 	if model == "" {
 		return fmt.Errorf("model must be set in the request or %s", llmModelEnvironment)
 	}
-	var apiKey string
-	if selected.APIKeyEnvironment != "" {
-		apiKey = getenv(llmAPIKeyEnvironment)
-		if strings.TrimSpace(apiKey) == "" {
-			apiKey = getenv(selected.APIKeyEnvironment)
-		}
-		if strings.TrimSpace(apiKey) == "" {
-			return fmt.Errorf(
-				"%s or %s must be set",
-				llmAPIKeyEnvironment,
-				selected.APIKeyEnvironment,
-			)
-		}
+	apiKey, err := selected.APIKey(getenv)
+	if err != nil {
+		return err
 	}
 	client, err := selected.NewClient(apiKey, configuredBaseURL, maxAttempts, getenv)
 	if err != nil {
@@ -283,6 +268,17 @@ func Run(
 			runErr = errors.Join(runErr, fmt.Errorf("close %s client: %w", selected.Name, err))
 		}
 	}()
+
+	selectedModel := llm.Model{ID: model, MaxOutputTokens: parsed.MaxOutputTokens, ReasoningEffort: reasoningEffort(parsed.ThinkingLevel)}
+	configDirectory, err := xdgpath.ConfigDirectory(getenv)
+	if err != nil {
+		return fmt.Errorf("resolve settings directory: %w", err)
+	}
+	modelSettings, err := settings.Load(filepath.Join(configDirectory, "settings.json"))
+	if err != nil {
+		return fmt.Errorf("load model settings: %w", err)
+	}
+	selectedModel.CompactionThreshold = modelSettings.Model(selected.Name, selectedModel.ID).CompactionThreshold
 
 	storeDirectory, err := resolveSessionDirectory(*sessionDirectory, getenv)
 	if err != nil {
@@ -361,14 +357,22 @@ func Run(
 	}
 
 	operations := operation.NewLocalOperationManager(runContext, configuredTools.RemoteJobs...)
-	inputs, err := inbox.New(runContext, restored.ExternalInputIDs)
+	defer func() {
+		cancel()
+		for range operations.Updates() {
+		}
+	}()
+	inputs, err := inbox.New(runContext, restored.InputIDs)
 	if err != nil {
 		return fmt.Errorf("open inbox: %w", err)
 	}
 	settingsPayload, err := json.Marshal(inbox.ControlMessage{
 		Mode: inbox.UpdateSettings,
 		Parameters: inbox.Settings{
-			ReasoningEffort: reasoningEffort(parsed.ThinkingLevel),
+			Model:               model,
+			CompactionThreshold: new(selectedModel.CompactionThreshold),
+			MaxOutputTokens:     parsed.MaxOutputTokens,
+			ReasoningEffort:     reasoningEffort(parsed.ThinkingLevel),
 		},
 	})
 	if err != nil {
@@ -408,10 +412,7 @@ func Run(
 	}
 
 	builder := contextbuilder.NewBuilder(registry.Skills()...)
-	builder.SetModel(llm.Model{
-		ID:              model,
-		ReasoningEffort: reasoningEffort(parsed.ThinkingLevel),
-	})
+	builder.SetModel(selectedModel)
 	systemPrompt := defaultSystemPrompt
 	if parsed.SystemPrompt != nil {
 		systemPrompt = *parsed.SystemPrompt
@@ -466,20 +467,21 @@ func resolveMaxAttempts(requested *int, getenv func(string) string) (int, error)
 	return maxAttempts, nil
 }
 
-func selectProvider(providers []Provider, name string) (Provider, error) {
-	for _, provider := range providers {
-		if provider.Name == name {
-			if provider.NewClient == nil {
-				return Provider{}, fmt.Errorf("provider %q has no client factory", name)
-			}
-			return provider, nil
-		}
+func readInput(ctx context.Context, input io.Reader) ([]byte, error) {
+	var raw []byte
+	var err error
+	done := make(chan struct{})
+	// A blocked stdin read can outlive cancellation until Main exits the process.
+	go func() {
+		raw, err = io.ReadAll(input)
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-done:
+		return raw, err
 	}
-	names := make([]string, 0, len(providers))
-	for _, provider := range providers {
-		names = append(names, provider.Name)
-	}
-	return Provider{}, fmt.Errorf("unsupported provider %q; available providers: %s", name, strings.Join(names, ", "))
 }
 
 func DecodeRequest(input io.Reader, destination any) error {
@@ -501,22 +503,11 @@ func resolveSessionDirectory(configured string, getenv func(string) string) (str
 	if configured = strings.TrimSpace(configured); configured != "" {
 		return filepath.Abs(configured)
 	}
-	stateHome := getenv("XDG_STATE_HOME")
-	if !filepath.IsAbs(stateHome) {
-		userHome := getenv("HOME")
-		if userHome == "" {
-			var err error
-			userHome, err = os.UserHomeDir()
-			if err != nil {
-				return "", fmt.Errorf("find home directory: %w; specify -session-directory to override", err)
-			}
-		}
-		if !filepath.IsAbs(userHome) {
-			return "", errors.New("set an absolute XDG_STATE_HOME or HOME, or specify -session-directory")
-		}
-		stateHome = filepath.Join(userHome, ".local", "state")
+	directory, err := xdgpath.SessionDirectory(getenv)
+	if err != nil {
+		return "", fmt.Errorf("%w; specify -session-directory to override", err)
 	}
-	return filepath.Join(stateHome, defaultSessionDirectory), nil
+	return directory, nil
 }
 
 func openDatetimeLog(directory string, now time.Time) (*os.File, error) {
@@ -605,6 +596,9 @@ func (scope *environmentScope) Close() error {
 }
 
 func validateRequest(parsed Request) ([]RequestMessage, error) {
+	if parsed.MaxOutputTokens != nil && *parsed.MaxOutputTokens <= 0 {
+		return nil, errors.New("max_output_tokens must be positive")
+	}
 	if parsed.SessionID != nil && strings.TrimSpace(*parsed.SessionID) == "" {
 		return nil, errors.New("session_id must not be empty")
 	}

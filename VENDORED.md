@@ -5,20 +5,21 @@ does, the runner wiring we need is copied out of its internal
 `cmd/internal/agentrunner` package and modified here. Each copy is a
 merge-resolution liability on every upstream bump.
 
-Pinned upstream: `github.com/unreallabsai/unreal-agent` `v0.2.0`, commit
-`1b9f778` (`third_party/unreal-agent/UPSTREAM_COMMIT`). `go.mod` must require
+Pinned upstream: `github.com/unreallabsai/unreal-agent` `v0.3.1`, commit
+`55747f5` (`third_party/unreal-agent/UPSTREAM_COMMIT`). `go.mod` must require
 the version that resolves to that same commit.
 
 | Our file | Upstream file @ pinned commit | What changed | Why |
 |---|---|---|---|
-| `internal/unrealrt/runtime.go` | `cmd/internal/agentrunner/run.go` (`Run`, `resolveSessionDirectory`, `resolveMaxAttempts`, `selectProvider`, `defaultSystemPrompt`, provider/key resolution) | One-shot `Run` split into `Runtime` + `Session` (`NewSession`, `ResumeSession`, `Prompt`, `Cancel`, `Replay`, `Close`). Request parsing, flags, JSONL output and `loadDotEnv` dropped. One store observer per runtime instead of one per run. | ACP needs many prompts per session and many sessions per process; `loadDotEnv` mutates process-wide env. |
-| `internal/unrealrt/providers.go` | `cmd/internal/agentrunner/providers.go`, `run.go` (`Provider`, `Client`) | Copied verbatim except package name. | `DefaultProviders` is internal upstream. |
+| `internal/unrealrt/runtime.go` | `cmd/internal/agentrunner/run.go` (`Run`, `resolveSessionDirectory`, `resolveMaxAttempts`, `defaultSystemPrompt`, provider/key resolution, model settings and compaction threshold, operation drain) | One-shot `Run` split into `Runtime` + `Session` (`NewSession`, `ResumeSession`, `Prompt`, `Cancel`, `Replay`, `Close`). Request parsing, flags, JSONL output, `max_output_tokens` and `loadDotEnv` dropped. One store observer per runtime instead of one per run. `settings.json` is loaded per prompt for the session's current model. | ACP needs many prompts per session and many sessions per process; the model can change between prompts; `loadDotEnv` mutates process-wide env. |
+| `internal/unrealrt/providers.go` | `cmd/internal/providers/providers.go` | Package name; `Default` renamed `DefaultProviders`, `Find` renamed `findProvider`. | The provider table is internal upstream. |
+| `internal/unrealrt/xdgpath.go` | `cmd/internal/xdgpath/directory.go` | Package name; functions unexported (`configDirectory`, `sessionDirectory`, `xdgDirectory`). | Session and settings directories must match `unreal-agent-runner`'s. |
 
 Pristine copies of every upstream file listed above live under
-`third_party/unreal-agent/` at the pinned commit, plus `config.go` from the same
-package (the `Request`/`Tools` types `run.go` is written against; nothing of it
-is vendored) for merge context. That directory has its own `go.mod` so the
-copies are never built.
+`third_party/unreal-agent/` at the pinned commit, plus
+`cmd/internal/agentrunner/config.go` (the `Request`/`Tools` types `run.go` is
+written against; nothing of it is vendored) for merge context. That directory
+has its own `go.mod` so the copies are never built.
 
 ## Bumping upstream
 
@@ -26,7 +27,9 @@ copies are never built.
    pristine file.
 2. Apply that diff by hand to our modified copies listed above.
 3. `scripts/vendor-diff.sh --update <commit>` refreshes the pristine copies
-   and `UPSTREAM_COMMIT`.
+   and `UPSTREAM_COMMIT`. It deletes pristine files that no longer exist
+   upstream; copy any file that replaces them (and any newly vendored file)
+   into `third_party/unreal-agent/` by hand.
 4. `go get github.com/unreallabsai/unreal-agent@<commit>` and `make test`.
 
 ## Known upstream gaps
