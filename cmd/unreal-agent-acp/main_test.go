@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 
 func TestMain(m *testing.M) {
 	if os.Getenv("UNREAL_AGENT_ACP_TEST_RUN_MAIN") == "1" {
+		os.Args = os.Args[:1] // drop the test binary's own flags
 		main()
 		return
 	}
@@ -120,5 +123,66 @@ func TestStdioSessionRoundTrip(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		command.Process.Kill()
 		t.Fatal("agent did not exit when stdin closed")
+	}
+}
+
+// buildAgent compiles the command with the given -ldflags, as a release build does.
+func buildAgent(t *testing.T, ldflags string) string {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "unreal-agent-acp")
+	build := exec.Command("go", "build", "-ldflags", ldflags, "-o", binary, ".")
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, output)
+	}
+	return binary
+}
+
+func TestVersionFlagPrintsTheReleaseVersion(t *testing.T) {
+	binary := buildAgent(t, "-X main.version=1.2.3")
+	for _, flag := range []string{"--version", "-version"} {
+		output, err := exec.Command(binary, flag).Output()
+		if err != nil {
+			t.Fatalf("%s: %v", flag, err)
+		}
+		if got := strings.TrimSpace(string(output)); got != "unreal-agent-acp 1.2.3" {
+			t.Fatalf("%s printed %q", flag, got)
+		}
+	}
+}
+
+func TestInitializeReportsTheReleaseVersion(t *testing.T) {
+	binary := buildAgent(t, "-X main.version=1.2.3")
+	command := exec.Command(binary)
+	command.Env = append(os.Environ(), "UNREAL_AGENT_ACP_SESSION_DIRECTORY="+t.TempDir())
+	command.Stdin = strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}` + "\n")
+	output, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		Result struct {
+			AgentInfo struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			} `json:"agentInfo"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &response); err != nil {
+		t.Fatalf("initialize output %q: %v", output, err)
+	}
+	if response.Result.AgentInfo.Name != "unreal-agent-acp" || response.Result.AgentInfo.Version != "1.2.3" {
+		t.Fatalf("agentInfo = %+v", response.Result.AgentInfo)
+	}
+}
+
+func TestUnknownArgumentsAreRejected(t *testing.T) {
+	binary := buildAgent(t, "")
+	command := exec.Command(binary, "--no-such-flag")
+	command.Stdin = strings.NewReader("")
+	err := command.Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 2 {
+		t.Fatalf("err = %v, want exit status 2", err)
 	}
 }
