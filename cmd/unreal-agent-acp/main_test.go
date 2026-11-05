@@ -155,10 +155,26 @@ func TestInitializeReportsTheReleaseVersion(t *testing.T) {
 	binary := buildAgent(t, "-X main.version=1.2.3")
 	command := exec.Command(binary)
 	command.Env = append(os.Environ(), "UNREAL_AGENT_ACP_SESSION_DIRECTORY="+t.TempDir())
-	command.Stdin = strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}` + "\n")
-	output, err := command.Output()
+	// Keep stdin open until the response arrives: the agent stops serving at EOF.
+	stdin, err := command.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
+	}
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer command.Wait()
+	defer stdin.Close()
+	if _, err := io.WriteString(stdin, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	output, err := bufio.NewReader(stdout).ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read initialize response: %v", err)
 	}
 	var response struct {
 		Result struct {
