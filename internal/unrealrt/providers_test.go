@@ -16,12 +16,12 @@ import (
 	"github.com/tilework-tech/unreal-agent-acp/internal/unrealrt"
 )
 
-// codexToken is an unsigned JWT shaped like a ChatGPT access token.
-func codexToken(t *testing.T, accountID string) string {
+// codexToken is an unsigned JWT shaped like a ChatGPT access token for account-1.
+func codexToken(t *testing.T, expires time.Time) string {
 	t.Helper()
 	claims, err := json.Marshal(map[string]any{
-		"exp":                         time.Now().Add(time.Hour).Unix(),
-		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": accountID},
+		"exp":                         expires.Unix(),
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "account-1"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +102,7 @@ func TestAnthropicProviderDefaultsToClaude(t *testing.T) {
 }
 
 func TestOpenAICodexDefaultsToGPT6Astra(t *testing.T) {
-	override, _ := codexEnv(t, codexToken(t, "account-1"))
+	override, _ := codexEnv(t, codexToken(t, time.Now().Add(time.Hour)))
 	f := newFixture(t, fakemodel.Sequence(fakemodel.Text("ok")), override)
 	s := f.newSession(t)
 	if got := s.Model(); got != "gpt-6-astra" {
@@ -162,5 +162,61 @@ func TestInvalidSettingsFailThePrompt(t *testing.T) {
 	})
 	if _, err := f.newSession(t).Prompt(t.Context(), "hi"); err == nil || !strings.Contains(err.Error(), "settings") {
 		t.Fatalf("err = %v, want a settings error", err)
+	}
+}
+
+func TestRewrittenCodexAuthFileIsUsedOnTheNextPrompt(t *testing.T) {
+	first, second := codexToken(t, time.Now().Add(time.Hour)), codexToken(t, time.Now().Add(2*time.Hour))
+	override, authFile := codexEnv(t, first)
+	f := newFixture(t, fakemodel.Sequence(fakemodel.Text("one"), fakemodel.Text("two")), override)
+	s := f.newSession(t)
+
+	prompt(t, s, "first")
+	writeCodexAuth(t, authFile, second)
+	prompt(t, s, "second")
+
+	requests := f.model.Requests()
+	if len(requests) != 2 {
+		t.Fatalf("model requests = %d", len(requests))
+	}
+	if got := requests[0].Header.Get("Authorization"); got != "Bearer "+first {
+		t.Fatal("first prompt did not use the original access token")
+	}
+	if got := requests[1].Header.Get("Authorization"); got != "Bearer "+second {
+		t.Fatal("second prompt did not use the rewritten access token")
+	}
+}
+
+func TestChangedAPIKeyIsUsedOnTheNextPrompt(t *testing.T) {
+	var env map[string]string
+	f := newFixture(t, fakemodel.Sequence(fakemodel.Text("one"), fakemodel.Text("two")), func(e map[string]string) { env = e })
+	s := f.newSession(t)
+
+	prompt(t, s, "first")
+	env["UNREAL_HARNESS_LLM_API_KEY"] = "rotated-key"
+	prompt(t, s, "second")
+
+	requests := f.model.Requests()
+	if got := requests[0].Header.Get("Authorization"); got != "Bearer test-key" {
+		t.Fatalf("first prompt Authorization = %q", got)
+	}
+	if got := requests[1].Header.Get("Authorization"); got != "Bearer rotated-key" {
+		t.Fatalf("second prompt Authorization = %q", got)
+	}
+}
+
+func TestExpiredCodexTokenFailsOnlyUntilTheFileIsRenewed(t *testing.T) {
+	override, authFile := codexEnv(t, codexToken(t, time.Now().Add(time.Hour)))
+	f := newFixture(t, fakemodel.Sequence(fakemodel.Text("one"), fakemodel.Text("two")), override)
+	s := f.newSession(t)
+	prompt(t, s, "first")
+
+	writeCodexAuth(t, authFile, codexToken(t, time.Now().Add(-time.Minute)))
+	if _, err := s.Prompt(t.Context(), "expired"); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("prompt with an expired token err = %v", err)
+	}
+	writeCodexAuth(t, authFile, codexToken(t, time.Now().Add(time.Hour)))
+	if result := prompt(t, s, "renewed"); result.Stop != unrealrt.StopEndTurn {
+		t.Fatalf("stop after renewal = %q", result.Stop)
 	}
 }

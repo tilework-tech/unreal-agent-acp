@@ -4,8 +4,9 @@
 // Modified: the one-shot Run is split into a long-lived Runtime and per-session
 // Session with Prompt/Cancel/Replay/Close. Request parsing, flags, JSONL output,
 // log files, max_output_tokens and loadDotEnv are dropped. One store observer
-// per Runtime instead of one per run. Model settings are loaded per prompt
-// for the session's current model. Merge-resolve on every upstream bump; see
+// per Runtime instead of one per run. The LLM client and model settings are
+// built per prompt, so renewed credentials and the session's current model
+// apply. Merge-resolve on every upstream bump; see
 // VENDORED.md. Delete once upstream exposes a public runtime package.
 
 // Package unrealrt runs long-lived unreal-agent sessions in-process.
@@ -132,9 +133,6 @@ type Runtime struct {
 	maxAttempts  int
 	heartbeat    time.Duration
 
-	clientMu sync.Mutex
-	client   Client
-
 	mu       sync.Mutex
 	sessions map[session.ID]*Session
 	closed   bool
@@ -214,7 +212,7 @@ func (runtime *Runtime) observe(id session.ID, item sessionstore.Item) {
 	}
 }
 
-// Close stops every running prompt and releases the LLM client. It is idempotent.
+// Close stops every running prompt. It is idempotent.
 func (runtime *Runtime) Close() error {
 	runtime.mu.Lock()
 	if runtime.closed {
@@ -233,21 +231,14 @@ func (runtime *Runtime) Close() error {
 		closeErr = errors.Join(closeErr, current.Close())
 	}
 	runtime.store.RemoveObserver(runtime.observerID)
-	runtime.clientMu.Lock()
-	defer runtime.clientMu.Unlock()
-	if runtime.client != nil {
-		closeErr = errors.Join(closeErr, runtime.client.Close())
-		runtime.client = nil
-	}
 	return closeErr
 }
 
-func (runtime *Runtime) llmClient() (Client, error) {
-	runtime.clientMu.Lock()
-	defer runtime.clientMu.Unlock()
-	if runtime.client != nil {
-		return runtime.client, nil
-	}
+// newClient builds an LLM client from the current environment and credential
+// files. Each prompt gets its own client, so credentials renewed by another
+// process (for example a rewritten Codex auth.json) apply from the next prompt.
+// The caller must close the client.
+func (runtime *Runtime) newClient() (Client, error) {
 	apiKey, err := runtime.provider.APIKey(runtime.getenv)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrAuthRequired, err)
@@ -256,8 +247,17 @@ func (runtime *Runtime) llmClient() (Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create %s client: %w", runtime.provider.Name, err)
 	}
-	runtime.client = client
 	return client, nil
+}
+
+// checkCredentials fails early, before a session is opened, when no client
+// can be built.
+func (runtime *Runtime) checkCredentials() error {
+	client, err := runtime.newClient()
+	if err != nil {
+		return err
+	}
+	return client.Close()
 }
 
 func (runtime *Runtime) checkOpen() error {
@@ -277,7 +277,7 @@ func (runtime *Runtime) NewSession(ctx context.Context, options Options) (*Sessi
 	if err != nil {
 		return nil, err
 	}
-	if _, err := runtime.llmClient(); err != nil {
+	if err := runtime.checkCredentials(); err != nil {
 		return nil, err
 	}
 	effort := options.ReasoningEffort
@@ -313,7 +313,7 @@ func (runtime *Runtime) ResumeSession(ctx context.Context, id session.ID, option
 	if err := runtime.checkOpen(); err != nil {
 		return nil, err
 	}
-	if _, err := runtime.llmClient(); err != nil {
+	if err := runtime.checkCredentials(); err != nil {
 		return nil, err
 	}
 	snapshot, err := runtime.store.Inspect(ctx, id)
@@ -659,10 +659,11 @@ func (current *Session) PromptFrom(ctx context.Context, arrival Arrival, text st
 
 func (current *Session) run(active *turn, meta metadata, text string) error {
 	runtime := current.runtime
-	client, err := runtime.llmClient()
+	client, err := runtime.newClient()
 	if err != nil {
 		return err
 	}
+	defer func() { _ = client.Close() }()
 	// The run context is independent of the caller's: cancellation goes through
 	// a hard-stop control so canceled operations are recorded in the session.
 	runContext, cancel := context.WithCancel(context.Background())
