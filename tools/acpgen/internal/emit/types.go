@@ -1,3 +1,6 @@
+// Derived from github.com/coder/acp-go-sdk cmd/generate@v0.13.5 (Apache-2.0).
+// Modified by Tilework Tech Inc.; see tools/acpgen/README.md.
+
 package emit
 
 import (

@@ -1,5 +1,7 @@
+// Derived from github.com/coder/acp-go-sdk cmd/generate@v0.13.5 (Apache-2.0).
+// Modified by Tilework Tech Inc.; see tools/acpgen/README.md.
+
 // Command acpgen generates ACP Go types from schema.json and meta.json.
-// Forked from github.com/coder/acp-go-sdk/cmd/generate (Apache-2.0); see README.md.
 package main
 
 import (

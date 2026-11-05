@@ -1,14 +1,32 @@
 unreal-agent-acp
+Copyright 2026 Tilework Tech Inc.
 
-This repository contains code derived from the following projects. Their
-license texts are kept under third_party/.
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+It includes software and data from the following projects. Their license
+texts are kept under third_party/.
 
-- unreal-agent (MIT, Copyright (c) 2026 Unreal Labs)
+unreal-agent
+  MIT License, Copyright (c) 2026 Unreal Labs
   https://github.com/unreallabsai/unreal-agent
-  Files under internal/unrealrt/ marked "VENDORED" are modified copies of
-  cmd/internal/agentrunner. See VENDORED.md and third_party/unreal-agent/LICENSE.
+  - internal/unrealrt/runtime.go, providers.go and xdgpath.go (files with a
+    "VENDORED from" header) are modified copies of its cmd/internal packages.
+    See VENDORED.md.
+  - third_party/unreal-agent/ holds unmodified copies of those upstream files.
+  License: third_party/unreal-agent/LICENSE
 
-- acp-go-sdk schema generator (Apache-2.0, Copyright Coder Technologies Inc.)
+acp-go-sdk schema generator
+  Apache License 2.0, Copyright 2025 Coder Technologies, Inc.
   https://github.com/coder/acp-go-sdk
-  tools/acpgen/ is a modified fork of cmd/generate. See
-  third_party/acp-go-sdk/LICENSE.
+  - tools/acpgen/ is a fork of cmd/generate at v0.13.5, modified by
+    Tilework Tech Inc. Modified files carry a "Derived from" header; the
+    changes are listed in tools/acpgen/README.md.
+  License: third_party/acp-go-sdk/LICENSE
+
+Agent Client Protocol
+  Apache License 2.0, Copyright 2025 Zed Industries, Inc. and contributors
+  https://github.com/agentclientprotocol/agent-client-protocol
+  - schema/v1 and schema/v2 are unmodified schema.json and meta.json release
+    assets.
+  - The doc comments in the generated acp/v1 and acp/v2 packages are derived
+    from those schemas.
+  License: third_party/agent-client-protocol/LICENSE
