@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,13 +23,39 @@ const (
 	modelsEnvironment           = "UNREAL_AGENT_ACP_MODELS"
 )
 
+// version is set at release time with -ldflags "-X main.version=<version>".
+var version = "dev"
+
 func main() {
+	flags := flag.NewFlagSet("unreal-agent-acp", flag.ContinueOnError)
+	printVersion := flags.Bool("version", false, "print the version and exit")
+	flags.Usage = func() {
+		fmt.Fprintln(flags.Output(), "Usage: unreal-agent-acp [--version]")
+		fmt.Fprintln(flags.Output(), "Speaks the Agent Client Protocol over stdin/stdout. Configuration is read from the environment.")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		os.Exit(2)
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintf(os.Stderr, "unreal-agent-acp: unexpected arguments %q\n", flags.Args())
+		flags.Usage()
+		os.Exit(2)
+	}
+	if *printVersion {
+		fmt.Println("unreal-agent-acp", agentVersion())
+		return
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	err := acpagent.Serve(ctx, os.Stdin, os.Stdout, acpagent.Config{
 		Name:    "unreal-agent-acp",
-		Version: version(),
+		Version: agentVersion(),
 		Runtime: unrealrt.Config{SessionDirectory: os.Getenv(sessionDirectoryEnvironment)},
 		Models:  models(os.Getenv(modelsEnvironment)),
 		Logger:  logger,
@@ -48,9 +76,14 @@ func models(list string) []string {
 	return names
 }
 
-func version() string {
-	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
+// agentVersion is the release version, else the module version recorded by
+// the Go toolchain (for example by go install), else "dev".
+func agentVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
 		return info.Main.Version
 	}
-	return "dev"
+	return version
 }

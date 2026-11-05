@@ -1,0 +1,33 @@
+version: 2
+project_name: unreal-agent-acp
+
+env:
+  - CGO_ENABLED=0
+
+builds:
+  - id: unreal-agent-acp
+    main: ./cmd/unreal-agent-acp
+    binary: unreal-agent-acp
+    targets: [linux_amd64, linux_arm64, darwin_arm64]
+    flags: [-trimpath, -mod=readonly]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  # The binary sits at the archive root: consumers run ./unreal-agent-acp
+  # straight after extracting. The name has no version so
+  # releases/latest/download/<name> always resolves.
+  - id: unreal-agent-acp
+    ids: [unreal-agent-acp]
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}-{{ .Os }}-{{ if eq .Arch "amd64" }}x86_64{{ else if eq .Arch "arm64" }}aarch64{{ else }}{{ .Arch }}{{ end }}
+    wrap_in_directory: false
+    files: [LICENSE, NOTICE]
+
+checksum:
+  name_template: SHA256SUMS
+  algorithm: sha256
+
+release:
+  name_template: '{{ .Tag }}'

@@ -1,6 +1,7 @@
 package translate_test
 
 import (
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"reflect"
 	"strings"
@@ -34,6 +35,13 @@ func modelResponse(id string, outputs ...llm.Item) sessionstore.Item {
 
 func message(providerID, text string) llm.Item {
 	return llm.Item{ProviderID: providerID, Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleAssistant, Text: text}}
+}
+
+func reasoning(providerID, text string) llm.Item {
+	return llm.Item{ProviderID: providerID, Type: llm.ItemProvider, Data: llm.ProviderItem{
+		Type: "reasoning", Raw: jsontext.Value(`{"type":"reasoning"}`),
+		Display: &llm.ProviderDisplay{Kind: llm.ProviderDisplayReasoning, Text: text},
+	}}
 }
 
 func call(callID, name, arguments string) llm.Item {
@@ -79,7 +87,7 @@ func TestUserInputBecomesUserMessageAndControlInputsAreHidden(t *testing.T) {
 
 func TestModelOutputBecomesThoughtsAndMessagesWithStableIDs(t *testing.T) {
 	item := modelResponse("resp-1",
-		llm.Item{ProviderID: "rs-1", Type: llm.ItemReasoning, Data: llm.Reasoning{Summary: []string{"Looking at files.", "Found it."}}},
+		reasoning("rs-1", "Looking at files.\n\nFound it."),
 		message("msg-1", "Here is the fix."),
 	)
 	updates := translateAll(item)
@@ -98,8 +106,31 @@ func TestModelOutputBecomesThoughtsAndMessagesWithStableIDs(t *testing.T) {
 }
 
 func TestEmptyReasoningProducesNoThought(t *testing.T) {
-	updates := translateAll(modelResponse("resp-1", llm.Item{Type: llm.ItemReasoning, Data: llm.Reasoning{}}))
+	updates := translateAll(modelResponse("resp-1", reasoning("rs-1", "  ")))
 	if len(updates) != 0 {
+		t.Fatalf("updates = %+v", updates)
+	}
+}
+
+func TestProviderItemsWithoutReasoningDisplayAreHidden(t *testing.T) {
+	updates := translateAll(modelResponse("resp-1",
+		llm.Item{ProviderID: "rs-1", Type: llm.ItemProvider, Data: llm.ProviderItem{Type: "reasoning", Raw: jsontext.Value(`{"type":"reasoning","encrypted_content":"x"}`)}},
+	))
+	if len(updates) != 0 {
+		t.Fatalf("updates = %+v", updates)
+	}
+}
+
+func TestCompactionSummariesAreNotShownAsAgentMessages(t *testing.T) {
+	compactionResponse := modelResponse("resp-2", message("msg-2", "Handoff summary for the next assistant."))
+	compactionResponse.Data = sessionstore.ModelResponse{TurnID: "turn-2", Response: compactionResponse.Data.(sessionstore.ModelResponse).Response}
+	updates := translateAll(
+		sessionstore.Item{Kind: sessionstore.ItemTurn, Data: session.Turn{ID: "turn-1", Type: session.TurnRegular}},
+		modelResponse("resp-1", message("msg-1", "First answer.")),
+		sessionstore.Item{Kind: sessionstore.ItemTurn, Data: session.Turn{ID: "turn-2", PreviousTurnID: "turn-1", Type: session.TurnCompaction}},
+		compactionResponse,
+	)
+	if len(updates) != 1 || updates[0].Text != "First answer." {
 		t.Fatalf("updates = %+v", updates)
 	}
 }

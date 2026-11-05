@@ -16,7 +16,7 @@ Path: @/internal/translate
 
 ### Core Implementation
 
-- External inbox inputs become `UserMessage` (control inputs are hidden). Model responses yield `AgentMessage` per non-empty message, `AgentThought` per non-empty reasoning summary, and `ToolCallStarted` per tool call. Message ids use the provider id, else `<responseID>-<index>`, so ids are stable across replay.
+- External inbox inputs become `UserMessage` (control inputs are hidden). Model responses yield `AgentMessage` per non-empty message, `AgentThought` per provider item with a non-empty reasoning display (upstream decodes legacy `reasoning` items into the same shape, so old session files replay unchanged; provider items without a reasoning display are hidden), and `ToolCallStarted` per tool call. Message ids use the provider id, else `<responseID>-<index>`, so ids are stable across replay.
 - Tool calls are remembered by call id so later `ToolCallStatus` items can be titled and their output rendered. Per-tool presentation:
 
 | Tool | Kind | Title / extras |
@@ -28,6 +28,7 @@ Path: @/internal/translate
 
 - Status mapping from the call's operations: any operation still running -> `in_progress`; otherwise any `Ready` (not started, e.g. awaiting approval) -> `pending`; otherwise any failed or canceled -> `failed`; otherwise `completed`. A call-level error with no operations (e.g. invalid arguments) is `failed` with `Error: ...` as output. Output is attached only to terminal updates.
 - A repeated identical non-terminal status for the same call is suppressed.
+- Responses to compaction turns (`session.Turn` of type `compaction`) are a handoff summary written for the model, so the translator remembers those turn ids and emits nothing for their responses.
 
 ### Things to Know
 

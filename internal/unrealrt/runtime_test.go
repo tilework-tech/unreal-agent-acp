@@ -51,6 +51,7 @@ func newFixture(t *testing.T, handler func(fakemodel.Request) fakemodel.Reply, o
 	t.Helper()
 	model := fakemodel.Start(t, handler)
 	env := model.Env()
+	env["XDG_CONFIG_HOME"] = t.TempDir()
 	for _, override := range overrides {
 		override(env)
 	}

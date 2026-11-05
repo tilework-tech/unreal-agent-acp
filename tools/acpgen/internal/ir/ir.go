@@ -1,3 +1,6 @@
+// Derived from github.com/coder/acp-go-sdk cmd/generate@v0.13.5 (Apache-2.0).
+// Modified by Tilework Tech Inc.; see tools/acpgen/README.md.
+
 // Package ir defines the intermediate representation used by the Go
 // code generator. It organizes methods, bindings, and schema-derived
 // types so the emit package can produce helpers, types, and dispatch code.

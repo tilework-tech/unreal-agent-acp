@@ -1,11 +1,13 @@
-// VENDORED from github.com/unreallabsai/unreal-agent@1b9f778
+// VENDORED from github.com/unreallabsai/unreal-agent@55747f5 (MIT; see third_party/unreal-agent/LICENSE)
 //   cmd/internal/agentrunner/run.go (Run, resolveSessionDirectory,
-//   resolveMaxAttempts, selectProvider, defaultSystemPrompt)
+//   resolveMaxAttempts, defaultSystemPrompt)
 // Modified: the one-shot Run is split into a long-lived Runtime and per-session
 // Session with Prompt/Cancel/Replay/Close. Request parsing, flags, JSONL output,
-// log files and loadDotEnv are dropped. One store observer per Runtime instead
-// of one per run. Merge-resolve on every upstream bump; see VENDORED.md.
-// Delete once upstream exposes a public runtime package.
+// log files, max_output_tokens and loadDotEnv are dropped. One store observer
+// per Runtime instead of one per run. The LLM client and model settings are
+// built per prompt, so renewed credentials and the session's current model
+// apply. Merge-resolve on every upstream bump; see
+// VENDORED.md. Delete once upstream exposes a public runtime package.
 
 // Package unrealrt runs long-lived unreal-agent sessions in-process.
 //
@@ -37,6 +39,7 @@ import (
 	"github.com/unreallabsai/unreal-agent/harness/session"
 	"github.com/unreallabsai/unreal-agent/harness/sessionstore"
 	"github.com/unreallabsai/unreal-agent/harness/sessionstore/localfile"
+	"github.com/unreallabsai/unreal-agent/harness/settings"
 	"github.com/unreallabsai/unreal-agent/harness/tool"
 	"github.com/unreallabsai/unreal-agent/harness/tool/bash"
 	"github.com/unreallabsai/unreal-agent/harness/tool/viewimage"
@@ -44,8 +47,6 @@ import (
 
 const (
 	defaultProvider           = "openai"
-	defaultSessionDirectory   = "unreal-agent/sessions"
-	llmAPIKeyEnvironment      = "UNREAL_HARNESS_LLM_API_KEY"
 	llmBaseURLEnvironment     = "UNREAL_HARNESS_LLM_BASE_URL"
 	llmModelEnvironment       = "UNREAL_HARNESS_LLM_MODEL"
 	llmProviderEnvironment    = "UNREAL_HARNESS_LLM_PROVIDER"
@@ -132,9 +133,6 @@ type Runtime struct {
 	maxAttempts  int
 	heartbeat    time.Duration
 
-	clientMu sync.Mutex
-	client   Client
-
 	mu       sync.Mutex
 	sessions map[session.ID]*Session
 	closed   bool
@@ -165,7 +163,7 @@ func New(config Config) (*Runtime, error) {
 	if providerName == "" {
 		providerName = defaultProvider
 	}
-	selected, err := selectProvider(providers, providerName)
+	selected, err := findProvider(providers, providerName)
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +212,7 @@ func (runtime *Runtime) observe(id session.ID, item sessionstore.Item) {
 	}
 }
 
-// Close stops every running prompt and releases the LLM client. It is idempotent.
+// Close stops every running prompt. It is idempotent.
 func (runtime *Runtime) Close() error {
 	runtime.mu.Lock()
 	if runtime.closed {
@@ -233,37 +231,33 @@ func (runtime *Runtime) Close() error {
 		closeErr = errors.Join(closeErr, current.Close())
 	}
 	runtime.store.RemoveObserver(runtime.observerID)
-	runtime.clientMu.Lock()
-	defer runtime.clientMu.Unlock()
-	if runtime.client != nil {
-		closeErr = errors.Join(closeErr, runtime.client.Close())
-		runtime.client = nil
-	}
 	return closeErr
 }
 
-func (runtime *Runtime) llmClient() (Client, error) {
-	runtime.clientMu.Lock()
-	defer runtime.clientMu.Unlock()
-	if runtime.client != nil {
-		return runtime.client, nil
-	}
-	var apiKey string
-	if runtime.provider.APIKeyEnvironment != "" {
-		apiKey = runtime.getenv(llmAPIKeyEnvironment)
-		if strings.TrimSpace(apiKey) == "" {
-			apiKey = runtime.getenv(runtime.provider.APIKeyEnvironment)
-		}
-		if strings.TrimSpace(apiKey) == "" {
-			return nil, fmt.Errorf("%w: set %s or %s", ErrAuthRequired, llmAPIKeyEnvironment, runtime.provider.APIKeyEnvironment)
-		}
+// newClient builds an LLM client from the current environment and credential
+// files. Each prompt gets its own client, so credentials renewed by another
+// process (for example a rewritten Codex auth.json) apply from the next prompt.
+// The caller must close the client.
+func (runtime *Runtime) newClient() (Client, error) {
+	apiKey, err := runtime.provider.APIKey(runtime.getenv)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrAuthRequired, err)
 	}
 	client, err := runtime.provider.NewClient(apiKey, runtime.baseURL, runtime.maxAttempts, runtime.getenv)
 	if err != nil {
 		return nil, fmt.Errorf("create %s client: %w", runtime.provider.Name, err)
 	}
-	runtime.client = client
 	return client, nil
+}
+
+// checkCredentials fails early, before a session is opened, when no client
+// can be built.
+func (runtime *Runtime) checkCredentials() error {
+	client, err := runtime.newClient()
+	if err != nil {
+		return err
+	}
+	return client.Close()
 }
 
 func (runtime *Runtime) checkOpen() error {
@@ -283,7 +277,7 @@ func (runtime *Runtime) NewSession(ctx context.Context, options Options) (*Sessi
 	if err != nil {
 		return nil, err
 	}
-	if _, err := runtime.llmClient(); err != nil {
+	if err := runtime.checkCredentials(); err != nil {
 		return nil, err
 	}
 	effort := options.ReasoningEffort
@@ -319,7 +313,7 @@ func (runtime *Runtime) ResumeSession(ctx context.Context, id session.ID, option
 	if err := runtime.checkOpen(); err != nil {
 		return nil, err
 	}
-	if _, err := runtime.llmClient(); err != nil {
+	if err := runtime.checkCredentials(); err != nil {
 		return nil, err
 	}
 	snapshot, err := runtime.store.Inspect(ctx, id)
@@ -665,10 +659,11 @@ func (current *Session) PromptFrom(ctx context.Context, arrival Arrival, text st
 
 func (current *Session) run(active *turn, meta metadata, text string) error {
 	runtime := current.runtime
-	client, err := runtime.llmClient()
+	client, err := runtime.newClient()
 	if err != nil {
 		return err
 	}
+	defer func() { _ = client.Close() }()
 	// The run context is independent of the caller's: cancellation goes through
 	// a hard-stop control so canceled operations are recorded in the session.
 	runContext, cancel := context.WithCancel(context.Background())
@@ -705,17 +700,38 @@ func (current *Session) run(active *turn, meta metadata, text string) error {
 		}
 	}
 
+	selectedModel := llm.Model{ID: meta.Model, ReasoningEffort: meta.ReasoningEffort}
+	settingsDirectory, err := configDirectory(runtime.getenv)
+	if err != nil {
+		return fmt.Errorf("resolve settings directory: %w", err)
+	}
+	modelSettings, err := settings.Load(filepath.Join(settingsDirectory, "settings.json"))
+	if err != nil {
+		return fmt.Errorf("load model settings: %w", err)
+	}
+	selectedModel.CompactionThreshold = modelSettings.Model(runtime.provider.Name, selectedModel.ID).CompactionThreshold
+
 	var operations operation.Manager = operation.NewLocalOperationManager(runContext)
 	if runtime.config.WrapOperations != nil {
 		operations = runtime.config.WrapOperations(current.id, operations)
 	}
-	inputs, err := inbox.New(runContext, restored.ExternalInputIDs)
+	// Wait for every operation to wind down before the prompt returns.
+	defer func() {
+		cancel()
+		for range operations.Updates() {
+		}
+	}()
+	inputs, err := inbox.New(runContext, restored.InputIDs)
 	if err != nil {
 		return fmt.Errorf("open inbox: %w", err)
 	}
 	if err := submitControl(runContext, inputs, inbox.ControlMessage{
-		Mode:       inbox.UpdateSettings,
-		Parameters: inbox.Settings{ReasoningEffort: meta.ReasoningEffort},
+		Mode: inbox.UpdateSettings,
+		Parameters: inbox.Settings{
+			Model:               selectedModel.ID,
+			CompactionThreshold: new(selectedModel.CompactionThreshold),
+			ReasoningEffort:     selectedModel.ReasoningEffort,
+		},
 	}); err != nil {
 		return err
 	}
@@ -746,7 +762,7 @@ func (current *Session) run(active *turn, meta metadata, text string) error {
 	}
 
 	builder := contextbuilder.NewBuilder(registry.Skills()...)
-	builder.SetModel(llm.Model{ID: meta.Model, ReasoningEffort: meta.ReasoningEffort})
+	builder.SetModel(selectedModel)
 	systemPrompt := runtime.config.SystemPrompt
 	if systemPrompt == "" {
 		systemPrompt = defaultSystemPrompt
@@ -824,40 +840,13 @@ func resolveMaxAttempts(getenv func(string) string) (int, error) {
 	return maxAttempts, nil
 }
 
-func selectProvider(providers []Provider, name string) (Provider, error) {
-	for _, provider := range providers {
-		if provider.Name == name {
-			if provider.NewClient == nil {
-				return Provider{}, fmt.Errorf("provider %q has no client factory", name)
-			}
-			return provider, nil
-		}
-	}
-	names := make([]string, 0, len(providers))
-	for _, provider := range providers {
-		names = append(names, provider.Name)
-	}
-	return Provider{}, fmt.Errorf("unsupported provider %q; available providers: %s", name, strings.Join(names, ", "))
-}
-
 func resolveSessionDirectory(configured string, getenv func(string) string) (string, error) {
 	if configured = strings.TrimSpace(configured); configured != "" {
 		return filepath.Abs(configured)
 	}
-	stateHome := getenv("XDG_STATE_HOME")
-	if !filepath.IsAbs(stateHome) {
-		userHome := getenv("HOME")
-		if userHome == "" {
-			var err error
-			userHome, err = os.UserHomeDir()
-			if err != nil {
-				return "", fmt.Errorf("find home directory: %w; set a session directory to override", err)
-			}
-		}
-		if !filepath.IsAbs(userHome) {
-			return "", errors.New("set an absolute XDG_STATE_HOME or HOME, or a session directory")
-		}
-		stateHome = filepath.Join(userHome, ".local", "state")
+	directory, err := sessionDirectory(getenv)
+	if err != nil {
+		return "", fmt.Errorf("%w; set a session directory to override", err)
 	}
-	return filepath.Join(stateHome, defaultSessionDirectory), nil
+	return directory, nil
 }

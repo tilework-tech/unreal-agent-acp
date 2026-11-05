@@ -37,7 +37,12 @@ git -C "$cache" --no-pager diff "$from" "$to_commit" -- "${files[@]}"
 
 if $update; then
   for path in "${files[@]}"; do
-    git -C "$cache" show "$to_commit:$path" > "$pristine/$path"
+    if git -C "$cache" cat-file -e "$to_commit:$path" 2>/dev/null; then
+      git -C "$cache" show "$to_commit:$path" > "$pristine/$path"
+    else
+      rm "$pristine/$path"
+      echo "Removed $path: it no longer exists upstream. Add any replacement file by hand." >&2
+    fi
   done
   echo "$to_commit" > "$pristine/UPSTREAM_COMMIT"
   echo "Pristine copies refreshed to $to_commit. Bump go.mod to the same commit." >&2

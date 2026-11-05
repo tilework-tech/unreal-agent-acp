@@ -14,6 +14,7 @@ import (
 	"github.com/unreallabsai/unreal-agent/harness/inbox"
 	"github.com/unreallabsai/unreal-agent/harness/llm"
 	"github.com/unreallabsai/unreal-agent/harness/operation"
+	"github.com/unreallabsai/unreal-agent/harness/session"
 	"github.com/unreallabsai/unreal-agent/harness/sessionstore"
 	"github.com/unreallabsai/unreal-agent/harness/tool"
 	"github.com/unreallabsai/unreal-agent/harness/tool/bash"
@@ -73,17 +74,28 @@ type Tool struct {
 type Session struct {
 	calls    map[string]llm.ToolCall
 	reported map[string]ToolStatus
+	// compactions holds the turns whose response is a context-compaction
+	// summary written for the model, not the user.
+	compactions map[session.TurnID]bool
 }
 
 func NewSession() *Session {
-	return &Session{calls: map[string]llm.ToolCall{}, reported: map[string]ToolStatus{}}
+	return &Session{calls: map[string]llm.ToolCall{}, reported: map[string]ToolStatus{}, compactions: map[session.TurnID]bool{}}
 }
 
 func (s *Session) Translate(item sessionstore.Item) []Update {
 	switch data := item.Data.(type) {
 	case inbox.Input:
 		return translateInput(data)
+	case session.Turn:
+		if data.Type == session.TurnCompaction {
+			s.compactions[data.ID] = true
+		}
+		return nil
 	case sessionstore.ModelResponse:
+		if s.compactions[data.TurnID] {
+			return nil
+		}
 		return s.translateResponse(data.Response)
 	case sessionstore.ToolCallStatus:
 		return s.translateStatus(data)
@@ -115,8 +127,11 @@ func (s *Session) translateResponse(response llm.Response) []Update {
 			if data.Text != "" {
 				updates = append(updates, Update{Kind: AgentMessage, MessageID: id, Text: data.Text})
 			}
-		case llm.Reasoning:
-			if text := strings.TrimSpace(strings.Join(data.Summary, "\n\n")); text != "" {
+		case llm.ProviderItem:
+			if data.Display == nil || data.Display.Kind != llm.ProviderDisplayReasoning {
+				continue
+			}
+			if text := strings.TrimSpace(data.Display.Text); text != "" {
 				updates = append(updates, Update{Kind: AgentThought, MessageID: id, Text: text})
 			}
 		case llm.ToolCall:
@@ -221,7 +236,7 @@ func outputText(call llm.ToolCall, status sessionstore.ToolCallStatus) string {
 		return "Error: " + err.Error()
 	}
 	var parts []string
-	for _, output := range translated.Output {
+	for _, output := range translated.ToLLMResult().Output {
 		if output.Kind == llm.ToolResultText {
 			parts = append(parts, output.Value)
 		}

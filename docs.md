@@ -30,12 +30,14 @@ Path: @/
 - @/acp/v1 and @/acp/v2 are generated from the pinned official schemas in @/schema by @/tools/acpgen (a fork of coder/acp-go-sdk's generator; no official Go SDK exists). Only v1 is wired; v2 compiles but no client speaks it yet. CI regenerates and fails on drift.
 - @/schema embeds the pinned `schema.json` files; @/internal/schemacheck validates JSON against them and is used only by tests.
 - @/internal/fakemodel is an `httptest` OpenAI Responses SSE server; @/internal/cmd/fake-model is a standalone binary of it for the TCK. It blocks forever on prompts containing `TCK-CANCEL` so cancellation always lands mid-turn.
-- @/third_party holds license texts plus pristine upstream copies of the vendored runner files (with their own `go.mod` so they are never built), used by @/scripts/vendor-diff.sh for 3-way merges on upstream bumps.
+- @/third_party holds third-party license texts (unreal-agent MIT, acp-go-sdk and Agent Client Protocol Apache-2.0) plus pristine upstream copies of the vendored runner files (with their own `go.mod` so they are never built), used by @/scripts/vendor-diff.sh for 3-way merges on upstream bumps.
+- Licensing: our code is Apache-2.0 (@/LICENSE); @/NOTICE lists every third-party component and where it lives.
+- Releases: @/.github/workflows/release.yml runs on `vX.Y.Z` tags that are on `main`, runs vet and tests, then @/.goreleaser.yaml builds static binaries (linux x86_64/aarch64, darwin aarch64) into `unreal-agent-acp-<os>-<arch>.tar.gz` archives with the binary, `LICENSE` and `NOTICE` at the root, plus `SHA256SUMS`. Archive names carry no version so `releases/latest/download/<name>` is stable; the Nori broker depends on both the name and the `./unreal-agent-acp` root layout. CI builds a snapshot on every PR and checks that layout.
 - @/scripts/tck.sh runs the official `agentclientprotocol/acp-tck` (pinned commit, via `uv`) against the built binary with the fake model.
 
 ### Core Implementation
 
-- **Startup.** @/cmd/unreal-agent-acp reads `UNREAL_AGENT_ACP_SESSION_DIRECTORY` and `UNREAL_AGENT_ACP_MODELS` and calls `acpagent.Serve` on stdin/stdout. `UNREAL_HARNESS_LLM_*` variables are read by @/internal/unrealrt. `Serve` creates one `unrealrt.Runtime`, injecting its own `Observer` and `WrapOperations` hooks, and runs a `jsonrpc.Conn` until stdin closes or SIGINT/SIGTERM.
+- **Startup.** @/cmd/unreal-agent-acp accepts only `--version` (prints `main.version`, set by release `-ldflags`, else the Go module version, else `dev`; the same value is `agentInfo.version` in `initialize`) and otherwise reads `UNREAL_AGENT_ACP_SESSION_DIRECTORY` and `UNREAL_AGENT_ACP_MODELS` and calls `acpagent.Serve` on stdin/stdout. `UNREAL_HARNESS_LLM_*` variables are read by @/internal/unrealrt. `Serve` creates one `unrealrt.Runtime`, injecting its own `Observer` and `WrapOperations` hooks, and runs a `jsonrpc.Conn` until stdin closes or SIGINT/SIGTERM.
 - **A prompt turn is fully synchronous before the response.**
 
 ```
@@ -44,7 +46,7 @@ session/prompt
   -> own goroutine in jsonrpc
   -> acpagent.prompt: flatten content blocks to one string
   -> unrealrt.Session.PromptFrom(arrival)
-       rebuild coordinator from store; submit settings control, user text, StopWhenIdle
+       build LLM client; rebuild coordinator from store; submit settings control, user text, StopWhenIdle
        coordinator.Run (same goroutine) -> LLM call / tool ops
          -> localfile store Append
            -> Runtime observer (synchronous)
@@ -74,10 +76,11 @@ session/prompt
 - Testing is black-box through public boundaries only: the ACP wire (an in-process client over pipes, plus a stdio round-trip against the real binary), the `unrealrt` API, or `operation.Manager`. Tests use a real `localfile` store, real `sh`, and the fake model over HTTP so the real upstream LLM client is exercised. The test client validates every outbound frame (notifications, permission requests, responses) against the pinned v1 schema. Conformance is checked by `make tck`.
 - `make test` runs with `-race`, which needs cgo (a C compiler and `CGO_ENABLED=1`). Without cgo, run `go test ./...` locally; CI runs the race build.
 - One prompt per session at a time; a concurrent prompt is rejected with `-32603`. Sessions are independent and may prompt concurrently.
-- Each prompt re-reads the session file and rebuilds the coordinator because upstream `coordinator.Run` is single-use.
+- Each prompt re-reads the session file and rebuilds the coordinator because upstream `coordinator.Run` is single-use. It also builds a fresh LLM client, so a rewritten Codex `auth.json` (or any other renewed credential file) applies from the next prompt; upstream never refreshes tokens itself.
+- Context compaction thresholds come from upstream's model catalog plus `settings.json`, per provider and the session's current model. Compaction summaries are not shown to the client.
 - Responses arrive as one `agent_message_chunk` per completed model message; upstream discards token deltas.
 - Permission mode and allow-always live only in memory: they reset to `ask` after `session/load`, `session/resume`, or a process restart.
 - Non-empty `mcpServers` are accepted and ignored with a stderr warning; MCP support is not implemented yet.
-- `usage_update` is not sent and `PromptResponse` carries no usage: ACP v1 `usage_update` requires a context-window size the agent does not know, and v1 `PromptResponse` has no usage field. `unrealrt` still sums usage per turn.
+- `usage_update` is not sent and `PromptResponse` carries no usage: ACP v1 `usage_update` requires a context-window size, which only the settings catalog knows (and only for catalog models), and v1 `PromptResponse` has no usage field. `unrealrt` still sums usage per turn.
 
 Created and maintained by Nori.

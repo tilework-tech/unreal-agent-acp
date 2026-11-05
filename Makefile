@@ -2,7 +2,7 @@ ACP_SCHEMA_V1 := 1.24.1
 ACP_SCHEMA_V2 := 2.0.0-alpha.7
 SCHEMA_URL := https://github.com/agentclientprotocol/agent-client-protocol/releases/download
 
-.PHONY: build test vet generate schemas tck vendor-diff
+.PHONY: build test vet generate schemas tck vendor-diff snapshot
 
 build:
 	go build -o bin/unreal-agent-acp ./cmd/unreal-agent-acp
@@ -37,3 +37,8 @@ tck: build
 
 vendor-diff:
 	./scripts/vendor-diff.sh $(TO)
+
+# Builds the release archives into dist/ without publishing (needs goreleaser v2).
+snapshot:
+	goreleaser check
+	goreleaser release --snapshot --clean

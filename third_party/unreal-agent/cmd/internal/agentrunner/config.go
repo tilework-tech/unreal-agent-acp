@@ -5,6 +5,7 @@ import (
 	"io"
 	"slices"
 
+	"github.com/unreallabsai/unreal-agent/cmd/internal/providers"
 	"github.com/unreallabsai/unreal-agent/harness/operation"
 	"github.com/unreallabsai/unreal-agent/harness/session"
 	"github.com/unreallabsai/unreal-agent/harness/tool"
@@ -12,7 +13,7 @@ import (
 
 type Config struct {
 	Name         string
-	Providers    []Provider
+	Providers    []providers.Provider
 	ParseRequest func(io.Reader) (Request, ToolFactory, error)
 }
 

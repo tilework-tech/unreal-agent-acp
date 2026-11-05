@@ -15,8 +15,9 @@ import (
 
 // Request is one decoded /responses call.
 type Request struct {
-	Body map[string]any
-	ctx  context.Context
+	Body   map[string]any
+	Header http.Header
+	ctx    context.Context
 }
 
 // Context is canceled when the client abandons the request.
@@ -214,7 +215,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, handler func(Requ
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	request := Request{Body: body, ctx: r.Context()}
+	request := Request{Body: body, Header: r.Header.Clone(), ctx: r.Context()}
 	s.mu.Lock()
 	s.requests = append(s.requests, request)
 	s.mu.Unlock()
